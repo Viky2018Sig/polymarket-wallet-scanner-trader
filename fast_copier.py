@@ -116,6 +116,18 @@ def _parse_args() -> argparse.Namespace:
         default=0.005,
         help="Slippage buffer on limit price (0.005 = 0.5%%)",
     )
+    p.add_argument(
+        "--profit-lock-at",
+        type=float,
+        default=2.0,
+        help="Activate trailing stop when bid reaches N× entry price (0 = disabled)",
+    )
+    p.add_argument(
+        "--profit-lock-trail",
+        type=float,
+        default=0.50,
+        help="Sell when bid drops to this fraction of peak (0.50 = 50%% of peak)",
+    )
     return p.parse_args()
 
 
@@ -141,11 +153,16 @@ def main() -> None:
             format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:8} | {name}:{function} | {message}",
         )
 
+    lock_str = (
+        f"profit_lock=OFF" if args.profit_lock_at <= 0
+        else f"profit_lock={args.profit_lock_at}x→trail@{args.profit_lock_trail:.0%}"
+    )
     logger.info(
         f"FastCopier config — scanner_db={args.scanner_db} "
         f"fast_db={args.fast_db} max_price={args.max_price} "
         f"bankroll=${args.bankroll:,.2f} "
-        f"live={'ON max_bet=$' + str(args.live_max_bet) if args.live else 'OFF (paper only)'}"
+        f"live={'ON max_bet=$' + str(args.live_max_bet) if args.live else 'OFF (paper only)'} "
+        f"{lock_str}"
     )
 
     copier = FastCopier(
@@ -160,6 +177,8 @@ def main() -> None:
         live_env_file=args.live_env,
         live_max_bet=args.live_max_bet,
         live_slippage=args.live_slippage,
+        profit_lock_at=args.profit_lock_at,
+        profit_lock_trail=args.profit_lock_trail,
     )
 
     try:

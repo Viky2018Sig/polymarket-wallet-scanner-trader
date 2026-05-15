@@ -144,7 +144,7 @@ def main():
 
     # ── Closed trades detail (most recent first) ─────────────────────────────
     cur.execute("""
-        SELECT wallet_followed, market_id, entry_price, exit_price, pnl, order_id
+        SELECT wallet_followed, market_id, entry_price, exit_price, pnl, order_id, status
         FROM fast_trades
         WHERE status LIKE 'CLOSED%'
         ORDER BY closed_at DESC
@@ -201,7 +201,7 @@ def main():
         header += "<code>───────────┼─────────┼───────┼───────┼──────</code>\n"
 
         lines = []
-        for wallet, market, buy, sell, pnl_val, order_id in closed_rows:
+        for wallet, market, buy, sell, pnl_val, order_id, status in closed_rows:
             w = shorten(wallet, 6)
             m = shorten(market, 6)
             buy_s = f"{buy:.4f}"
@@ -211,7 +211,12 @@ def main():
                 rr_s = f"{rr:5.1f}x"
             else:
                 rr_s = "  — "
-            flag = "L" if (order_id and order_id.strip()) else "P"
+            if status == "CLOSED_PROFIT_LOCK":
+                flag = "🔒"
+            elif order_id and order_id.strip():
+                flag = "L"
+            else:
+                flag = "P"
             lines.append(f"<code>{flag} {w:9s}│ {m:7s} │{buy_s:>7s}│{sell_s:>7s}│{rr_s:>6s}</code>")
 
         trades_block = header + "\n".join(lines)

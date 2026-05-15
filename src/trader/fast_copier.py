@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS fast_trades (
     closed_at       TEXT,
     notes           TEXT,
     order_id        TEXT,
+    peak_price      REAL DEFAULT 0,
+    tp_order_id     TEXT,
     UNIQUE(market_id, wallet_followed)
 );
 
@@ -97,7 +99,8 @@ class FastCopier:
     _WIN_THRESHOLD = Decimal("0.99")
     _LOSS_THRESHOLD = Decimal("0.01")
 
-    _POSITION_CHECK_INTERVAL = 5 * 60   # seconds
+    _POSITION_CHECK_INTERVAL = 5 * 60   # seconds — WIN/LOSS resolution check
+    _PROFIT_LOCK_INTERVAL = 10           # seconds — trailing stop price poll
     _ASSET_REFRESH_INTERVAL = 5 * 60
     _ACTIVITY_POLL_INTERVAL = 5          # seconds
     _SNAPSHOT_INTERVAL = 30 * 60
@@ -115,6 +118,8 @@ class FastCopier:
         live_env_file: str = "",
         live_max_bet: float = 2.0,
         live_slippage: float = 0.005,
+        profit_lock_at: float = 2.0,
+        profit_lock_trail: float = 0.50,
     ) -> None:
         self._scanner_db = scanner_db_path
         self._fast_db = fast_db_path
@@ -127,6 +132,8 @@ class FastCopier:
         self._live_env_file = live_env_file
         self._live_max_bet = live_max_bet
         self._live_slippage = live_slippage
+        self._profit_lock_at = profit_lock_at    # activate trailing stop at N× entry
+        self._profit_lock_trail = profit_lock_trail  # sell when bid falls to this fraction of peak
         self._clob_client: Any = None
 
         # asset_id → (wallet_address_lower, market_id)
@@ -161,12 +168,17 @@ class FastCopier:
             if stmt:
                 await self._conn.execute(stmt)
         await self._conn.commit()
-        # Additive migration: add order_id column to existing DBs
-        try:
-            await self._conn.execute("ALTER TABLE fast_trades ADD COLUMN order_id TEXT")
-            await self._conn.commit()
-        except Exception:
-            pass  # column already exists
+        # Additive migrations for existing DBs
+        for col_def in (
+            "order_id TEXT",
+            "peak_price REAL DEFAULT 0",
+            "tp_order_id TEXT",
+        ):
+            try:
+                await self._conn.execute(f"ALTER TABLE fast_trades ADD COLUMN {col_def}")
+                await self._conn.commit()
+            except Exception:
+                pass  # column already exists
         logger.info(f"Fast DB ready: {self._fast_db}")
 
     async def _load_scanner_data(self) -> None:
@@ -357,6 +369,7 @@ class FastCopier:
                 self._trade_processor(),
                 self._activity_poller(),
                 self._position_closer(),
+                self._profit_lock_worker(),
                 self._asset_refresher(),
                 self._snapshot_worker(),
             )
@@ -653,56 +666,107 @@ class FastCopier:
             except Exception as exc:
                 logger.error(f"Activity poller error: {exc}")
 
-    # ── Position closer ───────────────────────────────────────────────────────
+    # ── Live sell helper ──────────────────────────────────────────────────────
 
-    async def _position_closer(self) -> None:
-        """
-        Every 5 min: fetch CLOB asks for all open positions.
-        ask ≥ 0.99 → CLOSED_WIN, ask ≤ 0.01 → CLOSED_LOSS.
-        """
-        logger.info("FastCopier position closer started (5-min interval)")
+    async def _place_live_sell(self, asset_id: str, shares: float, bid: float) -> str:
+        """Place a GTC SELL order to lock in profit. Returns order_id or '' on failure."""
+        limit_price = round(max(bid * (1.0 - self._live_slippage), 0.01), 4)
+        shares_r = round(shares, 4)
 
-        async def _best_ask(asset_id: str) -> Tuple[str, Optional[float]]:
+        def _sell_sync() -> Dict[str, Any]:
+            if self._clob_client is None:
+                self._clob_client = self._build_live_client()
+            from py_clob_client_v2.clob_types import OrderArgsV2, OrderType
+            order_args = OrderArgsV2(
+                token_id=asset_id,
+                price=limit_price,
+                size=shares_r,
+                side="SELL",
+            )
+            return self._clob_client.create_and_post_order(order_args, order_type=OrderType.GTC)
+
+        try:
+            resp = await asyncio.to_thread(_sell_sync)
+            order_id = resp.get("orderID", resp.get("id", "")) if isinstance(resp, dict) else ""
+            logger.info(
+                f"LIVE SELL (profit-lock): asset={asset_id[:16]}… "
+                f"shares={shares_r} price={limit_price:.4f} "
+                f"order_id={order_id[:16] if order_id else '?'}"
+            )
+            return order_id or ""
+        except Exception as exc:
+            logger.error(f"Live SELL order error: asset={asset_id[:16]}… {exc}")
+            self._clob_client = None
+            return ""
+
+    # ── Price helper (shared by closer + profit-lock) ─────────────────────────
+
+    async def _fetch_prices(
+        self, asset_ids: List[str]
+    ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        """Fetch (bid, ask) for each asset_id concurrently."""
+
+        async def _one(asset_id: str) -> Tuple[str, Optional[float], Optional[float]]:
             try:
                 resp = await self._http.get(
-                    f"{_CLOB_BASE}/book",
-                    params={"token_id": asset_id},
+                    f"{_CLOB_BASE}/book", params={"token_id": asset_id}
                 )
                 if resp.status_code == 200:
-                    asks = resp.json().get("asks", [])
-                    if asks:
-                        best = min(asks, key=lambda x: float(x.get("price", 999)))
-                        return asset_id, float(best["price"])
-                # Fallback: last-trade-price
+                    book = resp.json()
+                    asks = book.get("asks", [])
+                    bids = book.get("bids", [])
+                    best_ask = (
+                        float(min(asks, key=lambda x: float(x.get("price", 999)))["price"])
+                        if asks else None
+                    )
+                    best_bid = (
+                        float(max(bids, key=lambda x: float(x.get("price", 0)))["price"])
+                        if bids else None
+                    )
+                    if best_ask is not None or best_bid is not None:
+                        return asset_id, best_bid, best_ask
+                # Fallback: last-trade-price as mid
                 resp2 = await self._http.get(
-                    f"{_CLOB_BASE}/last-trade-price",
-                    params={"token_id": asset_id},
+                    f"{_CLOB_BASE}/last-trade-price", params={"token_id": asset_id}
                 )
                 if resp2.status_code == 200:
                     p = resp2.json().get("price")
                     if p:
-                        return asset_id, float(p)
+                        mid = float(p)
+                        return asset_id, mid, mid
             except Exception:
                 pass
-            return asset_id, None
+            return asset_id, None, None
 
+        results = await asyncio.gather(*[_one(a) for a in asset_ids])
+        return {r[0]: (r[1], r[2]) for r in results}
+
+    # ── Position closer (WIN / LOSS at resolution) ────────────────────────────
+
+    async def _position_closer(self) -> None:
+        """
+        Every 5 min: check ask price for all open positions.
+          ask ≥ 0.99 → CLOSED_WIN
+          ask ≤ 0.01 → CLOSED_LOSS
+        """
+        logger.info("FastCopier position closer started (5-min interval)")
         while True:
             await asyncio.sleep(self._POSITION_CHECK_INTERVAL)
             try:
                 rows = await self._conn.execute_fetchall(
                     "SELECT id, asset_id, entry_price, shares, dollar_amount, "
-                    "market_id, wallet_followed FROM fast_trades WHERE status='OPEN'"
+                    "market_id, wallet_followed "
+                    "FROM fast_trades WHERE status='OPEN'"
                 )
                 if not rows:
                     continue
 
                 unique_assets = list({r[1] for r in rows if r[1]})
-                results = await asyncio.gather(*[_best_ask(a) for a in unique_assets])
-                ask_map: Dict[str, Optional[float]] = dict(results)
+                price_map = await self._fetch_prices(unique_assets)
 
                 wins = losses = 0
                 for trade_id, asset_id, entry_price, shares, dollar_amount, market_id, wallet in rows:
-                    ask = ask_map.get(asset_id)
+                    _, ask = price_map.get(asset_id, (None, None))
                     if ask is None:
                         continue
 
@@ -745,6 +809,96 @@ class FastCopier:
                     )
             except Exception as exc:
                 logger.error(f"Position closer error: {exc}")
+
+    # ── Trailing profit-lock (10-second poll) ─────────────────────────────────
+
+    async def _profit_lock_worker(self) -> None:
+        """
+        Every 10 s: track each position's peak bid price.
+        When bid peaked at ≥ profit_lock_at × entry AND current bid drops to
+        ≤ peak × profit_lock_trail → sell immediately (CLOSED_PROFIT_LOCK).
+
+        Example (defaults): bought at 0.10
+          → peak rises to 0.50 (5×) — trailing stop activates at 0.20 (2×)
+          → price falls back to 0.25 (50% of 0.50) → SELL, lock in 2.5× profit
+        """
+        if self._profit_lock_at <= 0:
+            logger.info("Profit-lock worker disabled (profit_lock_at=0)")
+            return
+
+        logger.info(
+            f"Profit-lock worker started (10s poll, "
+            f"activate≥{self._profit_lock_at}× entry, "
+            f"trail@{self._profit_lock_trail:.0%} of peak)"
+        )
+        while True:
+            await asyncio.sleep(self._PROFIT_LOCK_INTERVAL)
+            try:
+                rows = await self._conn.execute_fetchall(
+                    "SELECT id, asset_id, entry_price, shares, dollar_amount, "
+                    "market_id, wallet_followed, COALESCE(peak_price, 0) "
+                    "FROM fast_trades WHERE status='OPEN'"
+                )
+                if not rows:
+                    continue
+
+                unique_assets = list({r[1] for r in rows if r[1]})
+                price_map = await self._fetch_prices(unique_assets)
+
+                profit_locks = 0
+                for (trade_id, asset_id, entry_price, shares,
+                     dollar_amount, market_id, wallet, peak_price) in rows:
+                    bid, ask = price_map.get(asset_id, (None, None))
+
+                    # Use bid for value; fall back to ask if no bid quoted
+                    current = bid if bid is not None else ask
+                    if current is None:
+                        continue
+
+                    # Skip prices that already indicate resolution (handled by closer)
+                    if current >= float(self._WIN_THRESHOLD) or current <= float(self._LOSS_THRESHOLD):
+                        continue
+
+                    # Update peak
+                    new_peak = max(float(peak_price), current)
+                    if new_peak > float(peak_price):
+                        await self._conn.execute(
+                            "UPDATE fast_trades SET peak_price=? WHERE id=?",
+                            (new_peak, trade_id),
+                        )
+
+                    # Fire trailing stop
+                    if (
+                        new_peak >= entry_price * self._profit_lock_at
+                        and current <= new_peak * self._profit_lock_trail
+                    ):
+                        exit_p = current
+                        pnl = shares * exit_p - dollar_amount
+                        tp_order_id = ""
+                        if self._live_mode:
+                            tp_order_id = await self._place_live_sell(
+                                asset_id, shares, current
+                            )
+                        now = datetime.utcnow().isoformat()
+                        await self._conn.execute(
+                            "UPDATE fast_trades SET status='CLOSED_PROFIT_LOCK', "
+                            "exit_price=?, pnl=?, closed_at=?, tp_order_id=? WHERE id=?",
+                            (exit_p, pnl, now, tp_order_id, trade_id),
+                        )
+                        self._open_keys.discard((market_id, wallet))
+                        profit_locks += 1
+                        logger.info(
+                            f"PROFIT LOCK #{trade_id}: entry={entry_price:.4f} "
+                            f"peak={new_peak:.4f} ({new_peak/entry_price:.1f}x) "
+                            f"exit={exit_p:.4f} ({current/new_peak:.0%} of peak) "
+                            f"pnl={pnl:+.2f}"
+                        )
+
+                if profit_locks:
+                    await self._conn.commit()
+                    logger.info(f"Profit-lock: {profit_locks} positions exited this cycle")
+            except Exception as exc:
+                logger.error(f"Profit-lock worker error: {exc}")
 
     # ── Asset refresher ───────────────────────────────────────────────────────
 
