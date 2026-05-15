@@ -185,7 +185,7 @@ setup_wireguard() {
 # ============================================================
 # HOW TO GET A PEER:
 #
-# OPTION A — Mullvad VPN (recommended, ~$5/month, non-US servers)
+# OPTION A — Mullvad VPN (recommended, ~USD5/month, non-US servers)
 #   1. Go to https://mullvad.net/en/account/wireguard-config
 #   2. Generate a config for any non-US server (UK, NL, DE, etc.)
 #   3. Copy the [Interface] PrivateKey and [Peer] block from their config
@@ -200,7 +200,7 @@ setup_wireguard() {
 #   https://protonvpn.com/support/wireguard-manual-setup/
 #   Choose any non-US server.
 #
-# This VPS public key (share this with your peer/server):
+# This VPS public key (share with your peer/server):
 #   $LOCAL_PUBKEY
 # ============================================================
 
@@ -239,7 +239,7 @@ WGEOF
         warn "  │    Endpoint  = REPLACE_WITH_PEER_ENDPOINT:51820      │"
         warn "  │                                                      │"
         warn "  │  Quickest option: Mullvad VPN (https://mullvad.net)  │"
-        warn "  │    $5/month, pick any UK/NL/DE server, download      │"
+        warn "  │    USD5/month, pick any UK/NL/DE server, download    │"
         warn "  │    WireGuard config, paste the [Peer] block here.    │"
         warn "  │                                                      │"
         warn "  │  This VPS public key (add to your peer/server):      │"
