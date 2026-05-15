@@ -84,16 +84,23 @@ def main():
     # ── Live order stats ─────────────────────────────────────────────────────
     cur.execute("""
         SELECT
-            COUNT(*) FILTER (WHERE order_id IS NOT NULL AND order_id != '')  AS live_filled,
+            COUNT(*) FILTER (WHERE order_id IS NOT NULL AND order_id != '')        AS live_filled,
             COUNT(*) FILTER (WHERE (order_id IS NULL OR order_id = '')
-                             AND status='OPEN')                               AS paper_open,
+                             AND status='OPEN')                                     AS paper_open,
             COALESCE(SUM(dollar_amount) FILTER (
                 WHERE order_id IS NOT NULL AND order_id != ''
-                  AND status='OPEN'), 0)                                      AS live_deployed
+                  AND status='OPEN'), 0)                                            AS live_deployed,
+            COALESCE(SUM(pnl) FILTER (
+                WHERE order_id IS NOT NULL AND order_id != ''
+                  AND status LIKE 'CLOSED%'), 0)                                    AS live_realised_pnl,
+            COUNT(*) FILTER (WHERE order_id IS NOT NULL AND order_id != ''
+                             AND status LIKE 'CLOSED%' AND pnl > 0)                AS live_wins,
+            COUNT(*) FILTER (WHERE order_id IS NOT NULL AND order_id != ''
+                             AND status LIKE 'CLOSED%' AND pnl <= 0)               AS live_losses
         FROM fast_trades
     """)
     live_row = cur.fetchone()
-    live_filled, paper_open, live_deployed = live_row
+    live_filled, paper_open, live_deployed, live_realised_pnl, live_wins, live_losses = live_row
 
     # ── Closed trades detail (most recent first) ─────────────────────────────
     cur.execute("""
@@ -117,17 +124,21 @@ def main():
     pnl_sign = "+" if realised_pnl >= 0 else ""
     roi_sign = "+" if roi_pct >= 0 else ""
 
-    live_pct = (live_filled / open_trades * 100) if open_trades > 0 else 0.0
+    live_pnl_sign = "+" if live_realised_pnl >= 0 else ""
+    live_closed = live_wins + live_losses
+    live_win_rate = (live_wins / live_closed * 100) if live_closed > 0 else 0.0
 
     summary = (
         f"<b>⚡ FastCopier Report</b> — {now}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📂 Open positions:    <b>{open_trades}</b>  (${invested:,.2f} paper deployed)\n"
-        f"🔴 Live CLOB filled:  <b>{live_filled}</b>  (${live_deployed:,.2f} real)  📄 Paper-only: {paper_open}\n"
+        f"🔴 Live CLOB filled:  <b>{live_filled}</b>  (${live_deployed:,.2f} open)  📄 Paper-only: {paper_open}\n"
         f"✅ Closed trades:     <b>{closed_trades}</b>  ({profitable}✓ / {unprofitable}✗,  {win_rate:.0f}% hit rate)\n"
         f"\n"
-        f"💰 Realised P&amp;L:     <b>{pnl_sign}${realised_pnl:,.2f}</b>  ({roi_sign}{roi_pct:.2f}%)\n"
-        f"🏦 Portfolio value:   <b>${portfolio_value:,.2f}</b>  (started ${args.bankroll:,.0f})\n"
+        f"💵 Live realised P&amp;L: <b>{live_pnl_sign}${live_realised_pnl:,.2f}</b>  "
+        f"({live_wins}✓ / {live_losses}✗,  {live_win_rate:.0f}% hit rate)\n"
+        f"💰 Paper realised P&amp;L: <b>{pnl_sign}${realised_pnl:,.2f}</b>  ({roi_sign}{roi_pct:.2f}%)\n"
+        f"🏦 Paper portfolio:   <b>${portfolio_value:,.2f}</b>  (started ${args.bankroll:,.0f})\n"
         f"\n"
         f"🕐 Running since {since}"
     )
