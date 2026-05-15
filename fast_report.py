@@ -81,9 +81,23 @@ def main():
     row = cur.fetchone()
     open_trades, invested, closed_trades, realised_pnl, profitable, unprofitable, first_trade = row
 
+    # ── Live order stats ─────────────────────────────────────────────────────
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE order_id IS NOT NULL AND order_id != '')  AS live_filled,
+            COUNT(*) FILTER (WHERE (order_id IS NULL OR order_id = '')
+                             AND status='OPEN')                               AS paper_open,
+            COALESCE(SUM(dollar_amount) FILTER (
+                WHERE order_id IS NOT NULL AND order_id != ''
+                  AND status='OPEN'), 0)                                      AS live_deployed
+        FROM fast_trades
+    """)
+    live_row = cur.fetchone()
+    live_filled, paper_open, live_deployed = live_row
+
     # ── Closed trades detail (most recent first) ─────────────────────────────
     cur.execute("""
-        SELECT wallet_followed, market_id, entry_price, exit_price, pnl
+        SELECT wallet_followed, market_id, entry_price, exit_price, pnl, order_id
         FROM fast_trades
         WHERE status LIKE 'CLOSED%'
         ORDER BY closed_at DESC
@@ -103,10 +117,13 @@ def main():
     pnl_sign = "+" if realised_pnl >= 0 else ""
     roi_sign = "+" if roi_pct >= 0 else ""
 
+    live_pct = (live_filled / open_trades * 100) if open_trades > 0 else 0.0
+
     summary = (
         f"<b>⚡ FastCopier Report</b> — {now}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📂 Open positions:    <b>{open_trades}</b>  (${invested:,.2f} deployed)\n"
+        f"📂 Open positions:    <b>{open_trades}</b>  (${invested:,.2f} paper deployed)\n"
+        f"🔴 Live CLOB filled:  <b>{live_filled}</b>  (${live_deployed:,.2f} real)  📄 Paper-only: {paper_open}\n"
         f"✅ Closed trades:     <b>{closed_trades}</b>  ({profitable}✓ / {unprofitable}✗,  {win_rate:.0f}% hit rate)\n"
         f"\n"
         f"💰 Realised P&amp;L:     <b>{pnl_sign}${realised_pnl:,.2f}</b>  ({roi_sign}{roi_pct:.2f}%)\n"
@@ -117,12 +134,12 @@ def main():
 
     # ── Build closed trades table ─────────────────────────────────────────────
     if closed_rows:
-        header = "\n\n<b>📋 Closed Trades</b> (most recent first)\n"
-        header += "<code>Wallet   │ Market  │  Buy  │  Sell │   RR</code>\n"
-        header += "<code>─────────┼─────────┼───────┼───────┼──────</code>\n"
+        header = "\n\n<b>📋 Closed Trades</b> (most recent first  L=live  P=paper)\n"
+        header += "<code>  Wallet   │ Market  │  Buy  │  Sell │   RR</code>\n"
+        header += "<code>───────────┼─────────┼───────┼───────┼──────</code>\n"
 
         lines = []
-        for wallet, market, buy, sell, pnl_val in closed_rows:
+        for wallet, market, buy, sell, pnl_val, order_id in closed_rows:
             w = shorten(wallet, 6)
             m = shorten(market, 6)
             buy_s = f"{buy:.4f}"
@@ -132,7 +149,8 @@ def main():
                 rr_s = f"{rr:5.1f}x"
             else:
                 rr_s = "  — "
-            lines.append(f"<code>{w:9s}│ {m:7s} │{buy_s:>7s}│{sell_s:>7s}│{rr_s:>6s}</code>")
+            flag = "L" if (order_id and order_id.strip()) else "P"
+            lines.append(f"<code>{flag} {w:9s}│ {m:7s} │{buy_s:>7s}│{sell_s:>7s}│{rr_s:>6s}</code>")
 
         trades_block = header + "\n".join(lines)
         # Trim if combined message would exceed Telegram limit
