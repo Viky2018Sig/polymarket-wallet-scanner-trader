@@ -5,6 +5,7 @@ Usage: python fast_report.py [--bankroll 750]
 """
 import argparse
 import sqlite3
+import sys
 import urllib.request
 import urllib.parse
 import os
@@ -36,6 +37,41 @@ def load_env() -> dict:
     return env
 
 
+def fetch_live_cash(live_env_file: str) -> float:
+    """Query real USDC cash balance from CLOB. Returns -1.0 on failure."""
+    try:
+        sys.path.insert(0, str(_ROOT))
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
+        env: dict = {}
+        env_path = Path(live_env_file)
+        if not env_path.exists():
+            return -1.0
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip()
+        creds = ApiCreds(
+            api_key=env.get("CLOB_API_KEY", ""),
+            api_secret=env.get("CLOB_SECRET", ""),
+            api_passphrase=env.get("CLOB_PASSPHRASE", ""),
+        )
+        client = ClobClient(
+            "https://clob.polymarket.com",
+            chain_id=137,
+            key=env.get("PK", ""),
+            creds=creds,
+            signature_type=int(env.get("SIG_TYPE", "0")),
+            funder=env.get("PROXY_WALLET", ""),
+        )
+        resp = client.get_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        raw = resp.get("balance") if isinstance(resp, dict) else None
+        return round(float(raw) / 1_000_000, 2) if raw is not None else -1.0
+    except Exception:
+        return -1.0
+
+
 def shorten(addr: str, n: int = 6) -> str:
     """0xabcdef1234... → 0xabcdef"""
     if not addr:
@@ -48,6 +84,8 @@ def main():
     p.add_argument("--bankroll", type=float, default=750.0)
     p.add_argument("--live-bankroll", type=float, default=100.0,
                    help="Starting live USDC balance (actual deposit amount)")
+    p.add_argument("--live-env", default="/root/copybot-live/polymarket-copybot/.env",
+                   help="Path to live credentials .env (for real cash balance query)")
     p.add_argument("--fast-db", default=str(_ROOT / "fast_copier.db"))
     p.add_argument("--closed-limit", type=int, default=30,
                    help="Max closed trades shown in detail table")
@@ -129,21 +167,26 @@ def main():
     live_pnl_sign = "+" if live_realised_pnl >= 0 else ""
     live_closed = live_wins + live_losses
     live_win_rate = (live_wins / live_closed * 100) if live_closed > 0 else 0.0
-    live_portfolio_value = args.live_bankroll + live_realised_pnl
-    live_roi_pct = (live_realised_pnl / args.live_bankroll) * 100
+
+    # Real cash balance from CLOB on-chain
+    live_cash = fetch_live_cash(args.live_env)
+    live_cash_str = f"${live_cash:,.2f}" if live_cash >= 0 else "n/a"
+    live_portfolio_value = live_cash + live_deployed if live_cash >= 0 else live_deployed
+    live_gain = live_portfolio_value - args.live_bankroll
+    live_roi_pct = (live_gain / args.live_bankroll) * 100 if args.live_bankroll else 0.0
     live_roi_sign = "+" if live_roi_pct >= 0 else ""
 
     summary = (
         f"<b>⚡ FastCopier Report</b> — {now}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📂 Open positions:    <b>{open_trades}</b>  (${invested:,.2f} paper deployed)\n"
-        f"🔴 Live CLOB filled:  <b>{live_filled}</b>  (${live_deployed:,.2f} open)  📄 Paper-only: {paper_open}\n"
+        f"🔴 Live CLOB filled:  <b>{live_filled}</b>  📄 Paper-only: {paper_open}\n"
         f"✅ Closed trades:     <b>{closed_trades}</b>  ({profitable}✓ / {unprofitable}✗,  {win_rate:.0f}% hit rate)\n"
         f"\n"
         f"💵 Live realised P&amp;L: <b>{live_pnl_sign}${live_realised_pnl:,.2f}</b>  "
         f"({live_wins}✓ / {live_losses}✗,  {live_win_rate:.0f}% hit rate)\n"
         f"💼 Live portfolio:    <b>${live_portfolio_value:,.2f}</b>  ({live_roi_sign}{live_roi_pct:.2f}%)  "
-        f"(started ${args.live_bankroll:,.0f})\n"
+        f"cash {live_cash_str} + ${live_deployed:,.2f} in positions\n"
         f"\n"
         f"💰 Paper realised P&amp;L: <b>{pnl_sign}${realised_pnl:,.2f}</b>  ({roi_sign}{roi_pct:.2f}%)\n"
         f"🏦 Paper portfolio:   <b>${portfolio_value:,.2f}</b>  (started ${args.bankroll:,.0f})\n"
