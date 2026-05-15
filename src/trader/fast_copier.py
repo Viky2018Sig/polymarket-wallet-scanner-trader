@@ -261,14 +261,20 @@ class FastCopier:
         return ClobClient("https://clob.polymarket.com", **kwargs)
 
     async def _place_live_order(self, asset_id: str, price: float, dollar_amount: float) -> str:
-        """Place a real FOK BUY order on the CLOB via Brazil proxy. Returns order_id or ''."""
+        """
+        Place a BUY order on the CLOB via Brazil proxy.
+        Strategy: try FOK first (instant fill); if killed due to thin liquidity,
+        fall back to GTC limit order (placed on the book at our price).
+        Returns order_id or '' on failure.
+        """
         size = round(min(dollar_amount, self._live_max_bet), 2)
         if size < 1.0:
             logger.debug(f"Live order skipped: size ${size:.2f} < $1 minimum")
             return ""
         limit_price = round(min(price * (1.0 + self._live_slippage), 0.99), 4)
+        shares = round(size / limit_price, 4)
 
-        def _place_sync() -> Dict[str, Any]:
+        def _fok_sync() -> Dict[str, Any]:
             if self._clob_client is None:
                 self._clob_client = self._build_live_client()
             from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
@@ -283,21 +289,50 @@ class FastCopier:
                 order_args, order_type=OrderType.FOK
             )
 
-        try:
-            resp = await asyncio.to_thread(_place_sync)
-            order_id = (
-                resp.get("orderID", resp.get("id", ""))
-                if isinstance(resp, dict)
-                else ""
+        def _gtc_sync() -> Dict[str, Any]:
+            if self._clob_client is None:
+                self._clob_client = self._build_live_client()
+            from py_clob_client_v2.clob_types import OrderArgsV2, OrderType
+            order_args = OrderArgsV2(
+                token_id=asset_id,
+                price=limit_price,
+                size=shares,
+                side="BUY",
             )
+            return self._clob_client.create_and_post_order(order_args, order_type=OrderType.GTC)
+
+        # ── 1. Try FOK (instant fill) ─────────────────────────────────────────
+        try:
+            resp = await asyncio.to_thread(_fok_sync)
+            order_id = resp.get("orderID", resp.get("id", "")) if isinstance(resp, dict) else ""
             logger.info(
-                f"LIVE BUY: asset={asset_id[:16]}… price={limit_price:.4f} "
+                f"LIVE BUY (FOK): asset={asset_id[:16]}… price={limit_price:.4f} "
                 f"size=${size:.2f} order_id={order_id[:16] if order_id else '?'}"
             )
             return order_id or ""
-        except Exception as exc:
-            logger.error(f"Live order failed: asset={asset_id[:16]}… {exc}")
-            self._clob_client = None  # force rebuild on next attempt
+        except Exception as fok_exc:
+            fok_msg = str(fok_exc).lower()
+            if "fok" not in fok_msg and "fully filled" not in fok_msg:
+                logger.error(f"Live FOK order error: asset={asset_id[:16]}… {fok_exc}")
+                self._clob_client = None
+                return ""
+            logger.warning(
+                f"FOK killed (thin liquidity) → GTC fallback: "
+                f"asset={asset_id[:16]}… price={limit_price:.4f} size=${size:.2f}"
+            )
+
+        # ── 2. FOK was killed — place GTC limit order on the book ─────────────
+        try:
+            resp = await asyncio.to_thread(_gtc_sync)
+            order_id = resp.get("orderID", resp.get("id", "")) if isinstance(resp, dict) else ""
+            logger.info(
+                f"LIVE BUY (GTC): asset={asset_id[:16]}… price={limit_price:.4f} "
+                f"shares={shares} order_id={order_id[:16] if order_id else '?'}"
+            )
+            return order_id or ""
+        except Exception as gtc_exc:
+            logger.error(f"Live GTC order failed: asset={asset_id[:16]}… {gtc_exc}")
+            self._clob_client = None
             return ""
 
     # ── Entry point ───────────────────────────────────────────────────────────
