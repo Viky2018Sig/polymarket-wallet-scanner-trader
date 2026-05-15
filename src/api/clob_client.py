@@ -268,6 +268,16 @@ class ClobClient:
             logger.error(f"Failed to fetch last trade price for {token_id}: {exc}")
             return None
 
+    async def get_best_ask(self, token_id: str) -> Optional[float]:
+        """
+        Return the current best ask for a token, falling back to last trade price.
+        Used by the realtime monitor's price-ceiling guardrail.
+        """
+        book = await self.get_order_book(token_id)
+        if book is not None and book.best_ask is not None:
+            return book.best_ask
+        return await self.get_last_trade_price(token_id)
+
     async def get_midpoint_price(self, token_id: str) -> Optional[float]:
         """Get the mid-point of bid/ask for a token."""
         book = await self.get_order_book(token_id)

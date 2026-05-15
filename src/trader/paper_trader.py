@@ -69,6 +69,10 @@ class PaperTrader:
             logger.debug("No unacted signals to process")
             return []
 
+        # Build set of (market_id, wallet) already open to avoid duplicates
+        open_trades = await self._db.get_open_paper_trades()
+        open_keys: set = {(t.market_id, t.wallet_followed) for t in open_trades}
+
         opened: List[PaperTrade] = []
         skipped_stale = 0
         for signal in unacted:
@@ -78,9 +82,16 @@ class PaperTrader:
                 await self._db.mark_signal_acted_on(signal.id or 0)
                 skipped_stale += 1
                 continue
+            # Skip if we already have an open position in this market from the same wallet
+            key = (signal.market_id, signal.wallet_address)
+            if key in open_keys:
+                logger.debug(f"Skip signal {signal.id}: already open in {signal.market_id[:12]}…")
+                await self._db.mark_signal_acted_on(signal.id or 0)
+                continue
             trade = await self._open_trade(signal)
             if trade:
                 opened.append(trade)
+                open_keys.add(key)
                 await self._db.mark_signal_acted_on(signal.id or 0)
 
         if skipped_stale:
@@ -116,48 +127,37 @@ class PaperTrader:
     async def resolve_closed_markets(self) -> List[PaperTrade]:
         """
         Check open paper trades for markets that have resolved.
-        Closes positions with correct PnL calculation.
+
+        Primary method: check wallet_trades — if the tracked wallet has SELL trades
+        for the market whose FIFO-matched resolved_price is set, use that price.
+        This avoids unreliable Gamma API hex-condition-ID lookups entirely.
+
         Returns list of closed trades.
         """
         open_trades = await self._db.get_open_paper_trades()
         if not open_trades:
             return []
 
-        # Group by market_id to minimise API calls
-        by_market: Dict[str, List[PaperTrade]] = {}
-        for t in open_trades:
-            by_market.setdefault(t.market_id, []).append(t)
-
         closed: List[PaperTrade] = []
 
-        for market_id, trades in by_market.items():
+        for trade in open_trades:
             try:
-                market = await self._gamma.get_market(market_id)
-                if market is None:
+                exit_price = await self._db.get_wallet_exit_price(
+                    trade.market_id, trade.wallet_followed
+                )
+                if exit_price is None:
                     continue
 
-                if market.closed or market.archived:
-                    # Determine resolution price
-                    resolved_price = await self._get_resolved_price(market_id, market)
-                    if resolved_price is None:
-                        # Market closed but outcome unclear — use last trade price
-                        logger.warning(
-                            f"Market {market_id[:12]}… closed but no resolution price"
-                        )
-                        continue
-
-                    # Close all open positions for this market
-                    for trade in trades:
-                        closed_trade = await self._close_trade(trade, resolved_price)
-                        if closed_trade:
-                            closed.append(closed_trade)
-
-                    # Update wallet_trades cache with resolution
-                    await self._db.update_trade_resolution(market_id, resolved_price)
+                closed_trade = await self._close_trade(trade, Decimal(str(exit_price)))
+                if closed_trade:
+                    closed.append(closed_trade)
+                    logger.info(
+                        f"Closed trade #{trade.id} via wallet exit: "
+                        f"market={trade.market_id[:12]}… exit={exit_price:.4f}"
+                    )
 
             except Exception as exc:
-                logger.error(f"Error resolving market {market_id[:12]}…: {exc}")
-            await asyncio.sleep(0.3)
+                logger.error(f"Error resolving trade #{trade.id}: {exc}")
 
         if closed:
             logger.info(f"Resolved {len(closed)} paper trades from closed markets")
@@ -259,13 +259,55 @@ class PaperTrader:
             b = t.price_bucket
             bucket_breakdown[b] = bucket_breakdown.get(b, 0) + 1
 
+        # Unrealised PnL — fetch live CLOB ask prices for all open positions
+        unrealised_pnl = 0.0
+        priced_count = 0
+        from src.api.clob_client import ClobClient as _ClobClient
+        async with _ClobClient() as _clob:
+            for t in open_trades:
+                if not t.asset_id:
+                    continue
+                try:
+                    live_price = await _clob.get_best_ask(t.asset_id)
+                except Exception:
+                    live_price = None
+                if live_price is None:
+                    # fall back to last DB price
+                    live_price = await self._db.get_last_trade_price(t.asset_id)
+                if live_price is not None:
+                    unrealised_pnl += (live_price - float(t.entry_price)) * float(t.shares)
+                    priced_count += 1
+        logger.debug(f"Unrealised P&L computed from live prices: {priced_count}/{len(open_trades)} positions priced")
+
+        # Top 5 closed trades by PnL
+        top_trades = sorted(closed_trades, key=lambda t: float(t.pnl or 0), reverse=True)[:5]
+        top_trades_data = [
+            {
+                "id": t.id,
+                "market_id": t.market_id,
+                "wallet": t.wallet_followed,
+                "pnl": float(t.pnl or 0),
+                "entry_price": float(t.entry_price),
+                "exit_price": float(t.exit_price or 0),
+                "dollar_amount": float(t.dollar_amount),
+            }
+            for t in top_trades
+        ]
+
+        # Always recompute from live DB totals — never trust stale snapshot
+        realised_pnl = stats.get("total_pnl", 0.0)
+        current_bankroll = settings.starting_bankroll + realised_pnl
+        total_portfolio_value = current_bankroll + unrealised_pnl
+
         return {
-            "bankroll": float(self._bankroll),
+            "bankroll": current_bankroll,
             "starting_bankroll": settings.starting_bankroll,
+            "total_portfolio_value": total_portfolio_value,
             "total_pnl": stats.get("total_pnl", 0.0),
             "total_pnl_pct": (
                 stats.get("total_pnl", 0.0) / settings.starting_bankroll
             ),
+            "unrealised_pnl": unrealised_pnl,
             "open_count": stats.get("open_count", 0),
             "closed_count": stats.get("total_closed", 0),
             "wins": stats.get("wins", 0),
@@ -279,6 +321,7 @@ class PaperTrader:
             "equity_curve": equity_curve,
             "wallet_performance": wallet_perf,
             "price_bucket_breakdown": bucket_breakdown,
+            "top_trades": top_trades_data,
         }
 
     # ── Internal helpers ───────────────────────────────────────────────────────

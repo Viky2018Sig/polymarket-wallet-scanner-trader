@@ -137,10 +137,11 @@ class SignalEngine:
         # Persist new trades to cache
         await self._db.upsert_wallet_trades(new_trades)
 
-        # Only generate signals for BUY trades in the low-price range
+        # Generate signals for BUY trades up to signal_price_max (not just low_price_max)
         qualifying = [
             t for t in new_trades
-            if t.side.upper() == "BUY" and t.is_low_price
+            if t.side.upper() == "BUY"
+            and settings.low_price_min <= float(t.price) <= settings.signal_price_max
         ]
         if not qualifying:
             return []

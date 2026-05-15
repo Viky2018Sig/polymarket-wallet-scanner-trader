@@ -64,18 +64,18 @@ Three layers of adjustment are applied before the final bet size:
 |-------|-----------|---------|
 | Fractional Kelly | Multiply by safety factor | 0.25 (quarter Kelly) |
 | Price-scaled multiplier | Lower price → higher R:R → 1.0–1.5× | Linear over 0.01–0.15 |
-| Hard cap | Maximum % of bankroll per position | 3% |
+| Hard cap | Maximum % of bankroll per position | 0.25% (≈ $5 on $2,000) |
 
-**Example: $1,000 bankroll, entry at 0.12, wallet win rate 65%**
+**Example: $2,000 bankroll, entry at 0.06, wallet win rate 55%**
 ```
-Full Kelly  = (0.65 × 0.88 - 0.35 × 0.12) / 0.88 = 60.2%
-Quarter K   = 60.2% × 0.25 = 15.1%
-Price mult  = 15.1% × 1.1  = 16.6%  (price=0.12 scales to 1.1×)
-Hard cap    = min(16.6%, 3%) = 3.0%
-Bet size    = 3% × $1,000 = $30
+Full Kelly  = (0.55 × 0.94 - 0.45 × 0.06) / 0.94 = 52.1%
+Quarter K   = 52.1% × 0.25 = 13.0%
+Price mult  = 13.0% × 1.3  = 16.9%  (price=0.06 scales to ~1.3×)
+Hard cap    = min(16.9%, 0.25%) = 0.25%
+Bet size    = 0.25% × $2,000 = $5.00
 ```
 
-The price-scaled multiplier rewards entries closer to 0.01 with a slightly larger fraction (up to 1.5×), acknowledging the higher R:R at ultra-low prices. The hard 3% cap prevents over-concentration regardless of Kelly output.
+The price-scaled multiplier rewards entries closer to 0.01 with a slightly larger fraction (up to 1.5×), acknowledging the higher R:R at ultra-low prices. The hard 0.25% cap prevents over-concentration regardless of Kelly output.
 
 ---
 
@@ -83,13 +83,13 @@ The price-scaled multiplier rewards entries closer to 0.01 with a slightly large
 
 ```
 polymarket-wallet-scanner-trader/
-├── main.py                        # CLI entry point (8 commands)
+├── main.py                        # CLI entry point (9 commands)
 ├── config.py                      # All settings (env-overridable via .env)
 ├── src/
 │   ├── api/
 │   │   ├── data_client.py         # Data API (public) — trade discovery & wallet history
-│   │   ├── gamma_client.py        # Gamma API — market info, resolution prices
-│   │   ├── clob_client.py         # CLOB API — order books (optional auth)
+│   │   ├── gamma_client.py        # Gamma API — market info for signal alerts
+│   │   ├── clob_client.py         # CLOB API — order books, best ask prices
 │   │   └── models.py              # Pydantic v2 data models
 │   ├── scanner/
 │   │   ├── wallet_discovery.py    # Extract unique wallets from Data API trade stream
@@ -99,10 +99,11 @@ polymarket-wallet-scanner-trader/
 │   │   ├── metrics.py             # Profit factor, RR, drawdown, recency, diversity
 │   │   └── kelly.py               # Kelly criterion with fractional + price scaling
 │   ├── trader/
+│   │   ├── realtime_monitor.py    # Real-time monitor (10s poll, WebSocket-ready)
 │   │   ├── paper_trader.py        # Open/close paper positions, snapshots, reports
-│   │   └── signals.py             # Monitor tracked wallets, generate buy signals
+│   │   └── signals.py             # Legacy 30-min monitor + unfollow logic
 │   ├── storage/
-│   │   └── database.py            # SQLite (WAL mode), 5-table schema
+│   │   └── database.py            # SQLite (WAL mode), 5-table schema, prune/vacuum
 │   └── reporting/
 │       ├── dashboard.py           # Rich terminal dashboard
 │       └── telegram.py            # Telegram Bot API notifications
@@ -110,11 +111,39 @@ polymarket-wallet-scanner-trader/
 └── .env.example
 ```
 
+### Real-time Monitor Architecture
+
+The preferred monitor (`realtime` command) uses a producer/consumer pattern over an `asyncio.Queue`:
+
+```
+┌─────────────────────┐
+│  _poll_worker       │  ← polls Data API every 10s (all wallets concurrently)
+│  (swap for WS here) │    puts new WalletTrade events onto the queue
+└────────┬────────────┘
+         │ asyncio.Queue (maxsize=2000)
+┌────────▼────────────┐
+│  _signal_processor  │  ← applies guardrails, writes signals to DB
+│                     │    guardrail 0: BUY in 0.01–0.15 price range
+│                     │    guardrail 1: dedup (market already open → skip)
+│                     │    guardrail 2: market has ≥ MIN_SECONDS_REMAINING
+│                     │    guardrail 3: current ask ≤ signal_price × MAX_MULTIPLIER
+└────────┬────────────┘
+         │
+┌────────▼────────────┐    ┌──────────────────────┐
+│  _housekeep_worker  │    │  _unfollow_checker   │
+│  (prune DB, 6h)     │    │  (check exits, 30min)│
+└─────────────────────┘    └──────────────────────┘
+```
+
+**Price ceiling guardrail example**: wallet bought at 0.05 → copy price ceiling = 0.05 × 4 = 0.20. If the current best ask exceeds $0.20, the signal is skipped. This prevents chasing price in fast-moving markets.
+
+**WebSocket upgrade path**: replace `_poll_worker` with a WebSocket client that connects to `wss://ws-subscriptions-clob.polymarket.com/ws/` and puts parsed `WalletTrade` objects onto `self._queue`. Everything downstream (signal processor, housekeep, unfollow) is identical.
+
 **Data flow:**
 ```
 Data API (public) → wallet_discovery → wallet_trades (DB)
   → pnl_calculator (FIFO) → performance scorer
-  → wallets (DB) → signal engine → signals (DB)
+  → wallets (DB) → realtime_monitor (10s poll) → signals (DB)
   → paper_trader (freshness check) → paper_trades (DB)
   → portfolio_snapshots (DB) → dashboard / Telegram
 ```
@@ -124,8 +153,8 @@ Data API (public) → wallet_discovery → wallet_trades (DB)
 | API | Base URL | Auth | Purpose |
 |-----|----------|------|---------|
 | Data API | `https://data-api.polymarket.com` | None (public) | Wallet trade discovery & history |
-| Gamma API | `https://gamma-api.polymarket.com` | None | Market info, resolution prices |
-| CLOB API | `https://clob.polymarket.com` | Optional Bearer | Order books |
+| Gamma API | `https://gamma-api.polymarket.com` | None | Market end times, signal alert text |
+| CLOB API | `https://clob.polymarket.com` | Optional Bearer | Best ask prices for price ceiling check |
 
 ---
 
@@ -137,10 +166,16 @@ The system does **not** rely on the Gamma API for PnL resolution. Instead it use
 - The weighted-average sell price becomes the `resolved_price` for matched BUY trades.
 - Unmatched BUYs remain open (unresolved).
 
+**Resolution chain for paper trades:**
+1. Tracked wallet places SELL on Polymarket
+2. `realtime` monitor detects the SELL and caches it in `wallet_trades`
+3. Nightly cron runs `scan --skip-discovery` → FIFO calculator sets `resolved_price` on BUY rows
+4. Next `paper-trade` cycle calls `resolve_closed_markets()` → detects all BUYs resolved → closes paper trade at wallet's exit price
+
 This approach is:
 - **Offline** — no API calls needed, runs on cached trade data.
 - **Accurate** — handles partial fills and multiple SELLs against one BUY.
-- **Fast** — resolves ~52,000 trades in under 3 minutes.
+- **Fast** — resolves ~57,000 trades in under 3 minutes.
 
 ---
 
@@ -163,9 +198,9 @@ cp .env.example .env
 Edit `.env`:
 
 ```env
-STARTING_BANKROLL=1000
+STARTING_BANKROLL=2000
 KELLY_FRACTION=0.25
-MAX_POSITION_PCT=0.03
+MAX_POSITION_PCT=0.0025
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRstuVWXyz
 TELEGRAM_CHAT_ID=-100123456789
 ```
@@ -200,11 +235,11 @@ python3 main.py notify --test
 # Step 1 — Discover and score wallets (run once, then weekly)
 python3 main.py scan --max-pages 200 --top-n 50
 
-# Re-score wallets already in DB without re-fetching (fast):
+# Re-score wallets already in DB without re-fetching (fast, also resolves FIFO):
 python3 main.py scan --skip-discovery
 
-# Step 2 — Start signal monitor in background
-nohup python3 main.py monitor >> logs/monitor.log 2>&1 &
+# Step 2 — Start real-time signal monitor in background (preferred)
+nohup python3 main.py realtime >> logs/realtime.log 2>&1 &
 
 # Step 3 — Start paper trader in background
 nohup python3 main.py paper-trade >> logs/paper-trade.log 2>&1 &
@@ -230,40 +265,59 @@ python3 main.py backtest
 
 # Send current performance to Telegram now
 python3 main.py notify
+
+# Prune old DB rows and VACUUM (reclaim disk space)
+python3 main.py prune
 ```
 
-### Monitor & paper trader flags
+### Flags
 
 ```bash
 # Single cycle (useful for testing)
-python3 main.py monitor --once
+python3 main.py monitor --once       # legacy 30-min monitor
 python3 main.py paper-trade --once
 
 # Custom cycle interval (default 30 min)
 python3 main.py paper-trade --interval 15
+
+# All commands accept:
+python3 main.py <cmd> --log-level DEBUG --log-file logs/debug.log
 ```
 
 ---
 
-## Automated 2-Hour Telegram Reports (Cron)
-
-A system cron job sends a performance update to Telegram every 2 hours:
+## Automated Cron Jobs
 
 ```
-0 */2 * * *  cd /path/to/polymarket-wallet-scanner-trader && python3 main.py notify >> logs/notify.log 2>&1
+7 * * * *    cd /root/polymarket-wallet-scanner-trader && python3 main.py notify >> logs/notify.log 2>&1
+23 */4 * * * cd /root/polymarket-wallet-scanner-trader && python3 main.py scan --skip-discovery >> logs/scan.log 2>&1
+47 4 * * *   cd /root/polymarket-wallet-scanner-trader && python3 main.py prune >> logs/prune.log 2>&1
 ```
 
-**Install:**
+| Job | Schedule | Purpose |
+|-----|----------|---------|
+| `notify` | Every hour (at :07) | Send Telegram performance report |
+| `scan --skip-discovery` | Every 4h (at :23) | Refresh FIFO resolved prices → enables paper trade resolution |
+| `prune` | 4:47 AM daily | Delete old rows, VACUUM SQLite → bounds disk usage |
+
+**Critical dependency**: paper trades are resolved by detecting wallet exits via FIFO-resolved `resolved_price` values. These are only set when `scan --skip-discovery` runs. The every-4-hour cron keeps resolution lag under 4 hours.
+
+**Install all three crons:**
 ```bash
-(crontab -l 2>/dev/null; echo "0 */2 * * *  cd $(pwd) && python3 main.py notify >> logs/notify.log 2>&1") | crontab -
+crontab -e
+# Add the three lines above
 ```
 
-**View cron:**
-```bash
-crontab -l
-```
+---
 
-**Logs:** `logs/notify.log`
+## Disk Management
+
+The `prune` command (also auto-runs in `realtime` every 6 hours) deletes:
+- **Resolved `wallet_trades`** older than `WALLET_TRADES_RETENTION_DAYS` (default 90 days) — unresolved BUY rows are never deleted
+- **Acted-on signals** older than `SIGNALS_RETENTION_DAYS` (default 7 days)
+- **Duplicate portfolio snapshots** older than 7 days (keeps one per day)
+
+After deletion it runs `PRAGMA wal_checkpoint(TRUNCATE)` then `VACUUM` via a dedicated synchronous SQLite connection to fully reclaim disk space.
 
 ---
 
@@ -273,32 +327,32 @@ All values can be set in `.env` or exported as environment variables.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STARTING_BANKROLL` | 10000 | Paper trading starting bankroll (USD) |
+| `STARTING_BANKROLL` | 2000 | Paper trading starting bankroll (USD) |
 | `KELLY_FRACTION` | 0.25 | Quarter-Kelly safety multiplier |
-| `MAX_POSITION_PCT` | 0.03 | Hard cap: max 3% of bankroll per position |
+| `MAX_POSITION_PCT` | 0.0025 | Hard cap: max 0.25% of bankroll per position (≈ $5 on $2,000) |
 | `MIN_PROFIT_FACTOR` | 2.0 | Wallet qualification threshold |
 | `MIN_TRADES_REQUIRED` | 20 | Minimum resolved trades for scoring |
 | `LOW_PRICE_MIN_PCT` | 0.10 | Min fraction of wallet trades in 0.01–0.15 range |
 | `MAX_DRAWDOWN_THRESHOLD` | 0.40 | Reject wallets with drawdown > 40% |
 | `LOOKBACK_DAYS` | 90 | Historical window for wallet analysis |
-| `SCAN_INTERVAL_MINUTES` | 30 | Minutes between monitor cycles |
+| `SCAN_INTERVAL_MINUTES` | 30 | Minutes between legacy monitor / paper-trade cycles |
 | `MAX_TRACKED_WALLETS` | 50 | Max wallets to actively follow |
 | `LOW_PRICE_MIN` | 0.01 | Low-price range lower bound |
 | `LOW_PRICE_MAX` | 0.15 | Low-price range upper bound |
+| `REALTIME_POLL_SECONDS` | 10 | Poll interval for realtime monitor (seconds) |
+| `MAX_COPY_PRICE_MULTIPLIER` | 4.0 | Skip signal if ask > signal_price × this (price ceiling) |
+| `MIN_MARKET_SECONDS_REMAINING` | 60 | Skip market if fewer than this many seconds until close |
+| `WALLET_TRADES_RETENTION_DAYS` | 90 | Prune resolved wallet_trades older than this |
+| `SIGNALS_RETENTION_DAYS` | 7 | Prune acted-on signals older than this |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram Bot API token |
 | `TELEGRAM_CHAT_ID` | — | Target chat/channel ID |
 | `DATABASE_PATH` | ./polymarket_scanner.db | SQLite file path |
 | `LOG_LEVEL` | INFO | DEBUG / INFO / WARNING / ERROR |
-| `LOG_FILE` | — | Optional log file path |
+| `LOG_FILE` | ./logs/scanner.log | Log file path |
 | `MAX_REQUESTS_PER_SECOND` | 5.0 | API rate limit |
 | `POLYMARKET_API_KEY` | — | Optional CLOB Bearer token |
 | `UNFOLLOW_PROFIT_FACTOR_THRESHOLD` | 1.5 | Unfollow if last-10 PF drops below this |
 | `UNFOLLOW_LOOKBACK_TRADES` | 10 | Trade window for unfollow check |
-| `WEIGHT_PROFIT_FACTOR` | 0.30 | Composite score weight |
-| `WEIGHT_WIN_RATE` | 0.20 | Composite score weight |
-| `WEIGHT_LOW_PRICE_PCT` | 0.20 | Composite score weight |
-| `WEIGHT_RECENCY` | 0.15 | Composite score weight |
-| `WEIGHT_DIVERSITY` | 0.15 | Composite score weight |
 
 ---
 
@@ -319,37 +373,33 @@ Database runs in **WAL mode** (write-ahead logging) for concurrent read/write ac
 
 ## Telegram Message Format
 
-Example 2-hour update:
+Hourly update (sent at :07 each hour):
 
 ```
-🤖 Polymarket Scanner — 2h Update
+🤖 Polymarket Scanner — Hourly Update
 
 💼 Portfolio
-  Bankroll:     $  11,340.00
-  Starting:     $  10,000.00
-  Total P&L: 📈 +$1,340.00 (+13.4%)
+  Bankroll:          $   2,319.24
+  Starting:          $   2,000.00
+  Realised P&L:   📈 +$  319.24 (+16.0%)
+  Unrealised P&L: 📈 +$  450.00 (open positions marked to last price)
 
 📊 Performance
-  Closed Trades:  47  (18W / 29L)
-  Win Rate:       38.3%
-  Profit Factor:  ✅ 2.31
-  Gross Profit:   +$2,180.00
-  Gross Loss:     -$840.00
-  Max Drawdown:   ✅ 8.2%
-  Open Positions: 6
+  Closed Trades:  48  (26W / 22L)
+  Win Rate:       54.2%
+  Profit Factor:  ✅ 75.72
+  Gross Profit:   +$345.00
+  Gross Loss:     -$26.00
+  Max Drawdown:   ✅ 1.2%
+  Open Positions: 237
 
 🎯 Tracked Wallets: 8
 
-🪣 Price Buckets
-  0.01–0.05: 21 trades
-  0.05–0.10: 14 trades
-  0.10–0.15: 12 trades
+🏆 Top Trades by Profit
+  btc-5min-up-jun2026 | 0xe9076a87… | +$18.40 | 0.04→0.98
+  eth-5min-up-may2026 | 0xe9076a87… | +$14.20 | 0.03→0.97
 
-🏆 Top Wallets (paper)
-  0xf753…ccd4  12T 99%wr +$420.00
-  0xbaa8…1644   8T 87%wr +$310.00
-
-🕐 2026-05-12 18:00 UTC
+🕐 2026-05-13 14:07 UTC
 ```
 
 Real-time signal alerts are also sent when a tracked wallet opens a new low-price position.
@@ -383,13 +433,115 @@ Real-time signal alerts are also sent when a tracked wallet opens a new low-pric
 **Paper trader not opening trades**
 - Signals older than 60 minutes are automatically discarded (price may have moved).
 - Check `logs/paper-trade.log` for "Skipped N stale/invalid signals" messages.
-- Ensure the monitor is running and generating fresh signals.
+- Ensure the realtime monitor is running and generating fresh signals.
+
+**Open paper trades not resolving**
+- Resolution requires the nightly `scan --skip-discovery` cron to have run (sets `resolved_price` via FIFO).
+- Run manually: `python3 main.py scan --skip-discovery && python3 main.py paper-trade --once`
 
 **400 errors on Data API at offset 3500**
 - Expected — the Data API has a hard limit of 3,500 records per wallet. The paginator stops gracefully at this limit. These errors can be suppressed with `--log-level WARNING`.
 
+**Price ceiling triggering too often (missing trades)**
+- Lower `MAX_COPY_PRICE_MULTIPLIER` to 3.0 or raise to 5.0 in `.env`. Default 4× means wallet entry of 0.05 allows copy up to 0.20.
+
+---
+Claude Code built-ins (/command)
+
+/help — full help
+/config — change theme, model, etc.
+/clear — clear conversation
+/cost — show token usage
+/compact — compress context
+/memory — view/edit memory files
+Available skills (/skill-name)
+
+/update-config — configure hooks, permissions, env vars in settings.json
+/keybindings-help — customize keyboard shortcuts
+/simplify — review and clean up changed code
+/fewer-permission-prompts — auto-allowlist common read-only commands
+/loop — run a prompt on a recurring interval
+/schedule — schedule a recurring remote agent (cron)
+/claude-api — build/debug Anthropic SDK apps
+/init — generate a CLAUDE.md for a codebase
+/review — review a pull request
+/security-review — security review of current branch changes
+For this project specifically, the common commands are:
+
+
+python main.py realtime      # WS monitor (running, PID 253499)
+python main.py paper-trade   # paper trader (running, PID 113759)
+python main.py report        # P&L report to stdout
+python main.py notify        # send Telegram report
+python main.py scan --skip-discovery  # FIFO refresh (run every 4h via cron)
 ---
 
+---
+This is very revealing. The VPS is in Brazil (São Paulo), which means:
+
+CLOB API latency: 280ms (very high for an exchange - likely due to geographic distance from servers in US/EU)
+Data API: 115ms
+WS endpoint: 5ms TCP connect but actual WebSocket event delivery would be similar to CLOB (~200-300ms round trip)
+The Polymarket infrastructure is likely in the US (AWS US-East or similar). From Brazil to US, typical latency is 100-200ms.
+
+For sub-second copying to work, you'd ideally want a VPS close to Polymarket's servers.
+
+So the infrastructure is probably in AWS US-East-1 or a similar region. Looking at the actual timing breakdown: WebSocket detection takes 200-300ms, the CLOB order book check adds another 280ms, and order placement another 280ms—that's roughly 760ms total from when a wallet trade happens to when our order fills. For markets resolving in 5-15 seconds, that should theoretically be fast enough. The real bottleneck isn't the hardware itself but the G3 check eating up 280ms per call, plus the activity poller's 3-second delay. The WebSocket path should actually be quick enough if I bypass the poller.
+
+The catch is that we need to be subscribed to the exact asset a tracked wallet will buy before they buy it. The WebSocket worker subscribes to recent asset IDs from the past 7 days, which is broad coverage, but if a tracked wallet buys a completely new asset we haven't seen yet, we might not be listening for it. Actually, looking closer at the worker, it does pull all asset IDs from tracked wallets' recent activity, so we should be covered there—but I need to verify the subscription is actually capturing brand new assets in real time.
+
+The real constraint is that these prolific wallets like 0xe9076a87 trade across thousands of different markets, and we can't subscribe to all of them due to WebSocket limits. We're only subscribed to the most recent 500 or so assets. So the actual bottleneck is: for assets already in the database, the WebSocket fires and we detect within 200ms, but for completely new assets we're not subscribed to, we miss the signal entirely.
+
+The solution involves three key changes: relocating the VPS from Brazil to US-East to cut latency from 280ms down to ~20ms, skipping the G3 check that's already stale by the time we look at it and instead using the trade price as our entry point, and placing FOK orders immediately at slightly above the signal price when the WebSocket fires. But I'm realizing there's something odd here—if 0xe9076a87 buys at 0.05 and the market resolves to YES at 0.99 within seconds, there must be significant counter-liquidity available at those prices.
+
+The practical approach is to aggressively subscribe to all assets from the wallet's history, then fire off a FOK order at the exact price the moment the WebSocket signal hits—no G3 validation, just immediate execution. If it fills, we're in; if the market moved and it gets rejected, we lose nothing since it's fill-or-kill. This needs a VPS closer to Polymarket's infrastructure, modifications to the live_trader to bypass the G3 check on WebSocket signals, and USDC sitting in the proxy wallet ready to go.
+
+Looking at the latency breakdown: from Brazil to US-East is roughly 130ms one-way, so by the time our WebSocket client receives a trade event and we send a FOK order back, we're looking at around 263ms total—well within the 5-15 second resolution window for these markets. The real constraint is whether there's actually ask-side liquidity available at the price point we're targeting when our order arrives. moved to higher prices. If other bots are also frontrunning these trades, the liquidity at 0.05 gets eaten up fast. So the real constraint is whether we can get our order to the exchange before the book shifts—our current setup with ~280ms latency is too slow, but moving to a better location like AWS US-East-1 could cut that to ~20ms. The wallet's empty balance is also blocking us from testing this right now, and there's a chance these wallets have some information edge that lets them move ahead of us anyway.
+
+Here's the full technical picture:
+
+Current VPS latency to Polymarket:
+
+Location: Brazil (São Paulo) — this is the main problem
+CLOB REST: 280ms round trip
+WebSocket: ~260ms for events to arrive
+What sub-second copying actually requires:
+
+The WebSocket path already gives ~200ms detection. The chain for a live copy would be:
+
+
+Wallet buys at 0.05 → WS event fires → we receive it (+260ms) 
+→ place FOK order (+260ms) = ~520ms total
+For markets resolving in 5-15 seconds, 520ms is theoretically fast enough. The architecture is mostly already built — the WS worker, live_trader.py with FOK orders. The two blockers are:
+
+1. G3 kills us before placing the order
+Right now we check current ask (another 280ms CLOB call) before placing. By then ask = 0.99. The fix: skip G3 for the live path — place the FOK order optimistically at the signal price. If the order book has already moved, FOK gets rejected harmlessly (no fill = no loss).
+
+2. The proxy wallet has $0.37 USDC
+Zero capital deployed = zero trades possible even if the code is perfect.
+
+What a better VPS would give:
+
+Location	RTT to CLOB	Total latency
+Brazil (current)	280ms	~520ms
+AWS US-East-1 (Virginia)	~20ms	~50ms
+Moving to US-East would be a 10× improvement and would let you get in while there's still order book depth at the entry price.
+
+Bottom line — can the current VPS do it?
+
+Technically yes for markets resolving in >1 second — 520ms is inside the window
+Practically limited by Brazil latency — you'd compete poorly against bots on US servers
+Real blocker right now: empty proxy wallet
+Recommended path:
+
+Deposit USDC to proxy wallet 0x8905a77bB590138bA5d7d29f218Bd6De609Bb1cB
+Modify live trader to skip G3 and place FOK immediately on WS signal
+If results are good, migrate VPS to AWS US-East for 10× speed improvement
+Want me to make the code change for the live trader (skip G3, place FOK on WS signal directly)?
+
+no lets keep it like what it is now and monitor for 2 weeks
+i want to know if the other markets gives great results from other wallets.
+---
 ## Disclaimer
 
 This is a paper trading system for educational and research purposes. It does not execute real trades. Past performance of wallet addresses does not guarantee future results. Polymarket is a prediction market — all positions can expire worthless.

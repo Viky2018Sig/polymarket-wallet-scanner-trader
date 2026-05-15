@@ -63,6 +63,88 @@ class Settings(BaseSettings):
     # ── The Graph API ──────────────────────────────────────────────────────────
     graph_api_key: str = Field(default="", description="The Graph API key")
 
+    # ── Real-time monitor ─────────────────────────────────────────────────────
+    realtime_poll_seconds: int = Field(default=10, description="Seconds between poll cycles in realtime monitor (unused when WS is active)")
+    ws_reconnect_max_delay: int = Field(default=60, description="Max seconds between WebSocket reconnect attempts")
+    max_copy_price_multiplier: float = Field(
+        default=4.0,
+        description="Skip signal if current ask > signal_price × this (e.g. 4× means wallet bought 0.05, skip if ask > 0.20)",
+    )
+    signal_price_max: float = Field(
+        default=0.20,
+        description="Max entry price to trigger a copy signal. Wallet qualification still uses low_price_max (0.15). "
+                    "Capped at 0.20 to stay focused on high R:R entries (5x+ potential).",
+    )
+    min_market_seconds_remaining: int = Field(
+        default=60,
+        description="Skip market if fewer than this many seconds remain before close",
+    )
+
+    # ── Data retention / disk management ──────────────────────────────────────
+    wallet_trades_retention_days: int = Field(
+        default=90,
+        description="Days to keep resolved wallet_trades rows before pruning",
+    )
+    signals_retention_days: int = Field(
+        default=7,
+        description="Days to keep acted-on signal rows before pruning",
+    )
+
+    # ── Live trading ──────────────────────────────────────────────────────────
+    live_env_file: str = Field(
+        default="/root/copybot-live/polymarket-copybot/.env",
+        description="Path to .env file with live trading credentials (PK, CLOB_API_KEY, etc.)",
+    )
+    live_state_file: str = Field(
+        default="./data/live_state.json",
+        description="Path to JSON file for persisting live trading state",
+    )
+    live_starting_balance: float = Field(
+        default=100.0,
+        description="Starting USDC balance for live trading (read from wallet on init)",
+    )
+    max_live_bet_usd: float = Field(
+        default=5.0,
+        description="Maximum USDC per single live order",
+    )
+    max_live_positions: int = Field(
+        default=100,
+        description="Maximum concurrent live positions. At $2/trade and $500 balance, 100 = $200 max deployed.",
+    )
+    live_stop_loss_pct: float = Field(
+        default=0.20,
+        description="Stop-loss threshold as fraction of entry price (0.20 = 20% loss)",
+    )
+    live_stop_loss_min_entry: float = Field(
+        default=0.30,
+        description="Stop-loss only applied when entry price >= this value (longshots held to resolution)",
+    )
+    live_take_profit_price: float = Field(
+        default=0.80,
+        description="Take-profit price for low-entry (<0.30) positions",
+    )
+    live_take_profit_gain_pct: float = Field(
+        default=0.50,
+        description="Take-profit trigger: percentage gain for mid-entry (>=0.30) positions",
+    )
+    live_max_position_age_days: int = Field(
+        default=30,
+        description="Auto-expire positions older than this many days",
+    )
+    live_clob_slippage: float = Field(
+        default=0.005,
+        description="Slippage buffer applied to limit price on FOK orders (0.005 = 0.5%)",
+    )
+    live_min_entry_price: float = Field(
+        default=0.01,
+        description="Minimum entry price for live trades. Raise to 0.05 to skip micro-longshots.",
+    )
+    live_max_entry_price: float = Field(
+        default=0.10,
+        description="Maximum entry price for live trades. 0.10 = 10x+ R:R only. "
+                    "Set to 0.20 to include the full signal_price_max range.",
+    )
+
     # ── Signal / follow management ────────────────────────────────────────────
     unfollow_profit_factor_threshold: float = Field(
         default=1.5,

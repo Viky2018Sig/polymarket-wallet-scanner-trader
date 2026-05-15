@@ -142,6 +142,8 @@ def _format_report(report: Dict[str, Any]) -> str:
     starting = report.get("starting_bankroll", 0.0)
     total_pnl = report.get("total_pnl", 0.0)
     total_pnl_pct = report.get("total_pnl_pct", 0.0)
+    unrealised_pnl = report.get("unrealised_pnl", 0.0)
+    total_portfolio_value = report.get("total_portfolio_value", bankroll + unrealised_pnl)
     open_count = report.get("open_count", 0)
     closed_count = report.get("closed_count", 0)
     wins = report.get("wins", 0)
@@ -153,19 +155,20 @@ def _format_report(report: Dict[str, Any]) -> str:
     max_drawdown = report.get("max_drawdown", 0.0)
     tracked_wallets = report.get("tracked_wallets", 0)
 
-    pnl_sign = "+" if total_pnl >= 0 else ""
     pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+    unr_emoji = "📈" if unrealised_pnl >= 0 else "📉"
     pf_emoji = "✅" if profit_factor >= 2 else ("⚠️" if profit_factor >= 1 else "❌")
     dd_emoji = "❌" if max_drawdown > 0.3 else ("⚠️" if max_drawdown > 0.15 else "✅")
 
-    # Portfolio section
     lines = [
-        "🤖 <b>Polymarket Scanner — 2h Update</b>",
+        "🤖 <b>Polymarket Scanner — Hourly Update</b>",
         "",
         "💼 <b>Portfolio</b>",
-        f"  Bankroll:     <code>${bankroll:>10,.2f}</code>",
-        f"  Starting:     <code>${starting:>10,.2f}</code>",
-        f"  Total P&amp;L: {pnl_emoji} <code>{pnl_sign}${total_pnl:,.2f} ({total_pnl_pct:+.1%})</code>",
+        f"  Total Value:        <code>${total_portfolio_value:,.2f}</code>",
+        f"  Starting Capital:   <code>${starting:,.2f}</code>",
+        f"  Realised P&amp;L:   {pnl_emoji} <code>${total_pnl:+,.2f} ({total_pnl_pct:+.1%})</code>",
+        f"  Bankroll (realised):<code>${bankroll:,.2f}</code>",
+        f"  Unrealised P&amp;L: {unr_emoji} <code>${unrealised_pnl:+,.2f}</code>",
         "",
         "📊 <b>Performance</b>",
         f"  Closed Trades:  <b>{closed_count}</b>  ({wins}W / {losses}L)",
@@ -175,38 +178,27 @@ def _format_report(report: Dict[str, Any]) -> str:
         f"  Gross Loss:     <code>-${gross_loss:,.2f}</code>",
         f"  Max Drawdown:   {dd_emoji} <b>{max_drawdown:.1%}</b>",
         f"  Open Positions: <b>{open_count}</b>",
-        "",
-        f"🎯 <b>Tracked Wallets:</b> {tracked_wallets}",
+        f"  Tracked Wallets: <b>{tracked_wallets}</b>",
     ]
 
-    # Price bucket breakdown
-    buckets = report.get("price_bucket_breakdown", {})
-    if buckets:
+    # Top closed trades by PnL
+    top_trades = report.get("top_trades", [])
+    if top_trades:
         lines.append("")
-        lines.append("🪣 <b>Price Buckets</b>")
-        for bucket, count in sorted(buckets.items()):
-            lines.append(f"  {bucket}: <b>{count}</b> trades")
-
-    # Top performing wallets
-    wallet_perf = report.get("wallet_performance", {})
-    if wallet_perf:
-        top = sorted(wallet_perf.items(), key=lambda x: x[1]["pnl"], reverse=True)[:5]
-        lines.append("")
-        lines.append("🏆 <b>Top Wallets (paper)</b>")
-        for addr, data in top:
-            t = data["trades"]
-            w = data["wins"]
-            p = data["pnl"]
-            p_sign = "+" if p >= 0 else ""
-            wr = w / t if t > 0 else 0
+        lines.append("🏆 <b>Top Trades by Profit</b>")
+        for t in top_trades:
+            market_slug = t["market_id"][2:14]  # strip 0x, take 12 chars
+            wallet_short = f"{t['wallet'][:6]}…{t['wallet'][-4:]}"
+            pnl = t["pnl"]
+            entry = t["entry_price"]
+            exit_p = t["exit_price"]
             lines.append(
-                f"  <code>{addr[:6]}…{addr[-4:]}</code> "
-                f"{t}T {wr:.0%}wr {p_sign}${p:.2f}"
+                f"  <code>{market_slug}</code> | <code>{wallet_short}</code>\n"
+                f"    Profit: <b>${pnl:+,.2f}</b>  "
+                f"In: {entry:.4f} → Out: {exit_p:.4f}"
             )
 
     lines.append("")
-    lines.append(
-        f"<i>🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</i>"
-    )
+    lines.append(f"<i>🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</i>")
 
     return "\n".join(lines)

@@ -50,13 +50,14 @@ class Database:
     async def connect(self) -> None:
         """Open connection and run schema migration."""
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self._path)
+        self._conn = await aiosqlite.connect(self._path, timeout=30)
         self._conn.row_factory = aiosqlite.Row
         # Enable WAL mode for concurrent reads
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA cache_size=-32768")  # 32 MB
+        await self._conn.execute("PRAGMA busy_timeout=30000")  # 30s wait on lock
         await self._migrate()
         await self._conn.commit()
 
@@ -575,6 +576,33 @@ class Database:
             rows = await cur.fetchall()
         return [_row_to_signal(r) for r in rows]
 
+    async def get_wallet_exit_price(self, market_id: str, wallet_address: str) -> Optional[float]:
+        """
+        Return the FIFO-resolved exit price for a (market, wallet) pair if the
+        tracked wallet has fully exited — i.e. all BUY trades have a resolved_price.
+        Returns None if the wallet still holds an open position.
+        """
+        assert self._conn is not None
+        async with self._conn.execute(
+            """
+            SELECT
+                COUNT(*) as total_buys,
+                SUM(CASE WHEN resolved_price IS NOT NULL THEN 1 ELSE 0 END) as resolved_buys,
+                AVG(CAST(resolved_price AS REAL)) as avg_exit
+            FROM wallet_trades
+            WHERE market_id = ? AND wallet_address = ? AND side = 'BUY'
+            """,
+            (market_id, wallet_address),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row or not row[0]:
+            return None
+        total, resolved, avg_exit = row
+        # Only consider fully exited (all BUYs resolved)
+        if resolved < total or avg_exit is None:
+            return None
+        return float(avg_exit)
+
     async def get_last_trade_price(self, asset_id: str) -> Optional[float]:
         """Return the most recent trade price for a given asset/token ID."""
         assert self._conn is not None
@@ -602,6 +630,32 @@ class Database:
             except ValueError:
                 return None
         return None
+
+    async def get_tracked_asset_ids(self, since_days: int = 1, limit: int = 500) -> List[str]:
+        """
+        Return the most recently traded asset_ids of tracked wallets (for WS subscriptions).
+
+        Ordered by most-recent trade so that the `limit` cap keeps the freshest markets.
+        Use since_days=1 by default so 5-minute recurring markets are always included.
+        """
+        assert self._conn is not None
+        cutoff = (datetime.utcnow() - __import__("datetime").timedelta(days=since_days)).isoformat()
+        async with self._conn.execute(
+            """
+            SELECT wt.asset_id, MAX(wt.matched_at) AS last_seen
+            FROM wallet_trades wt
+            JOIN wallets w ON w.wallet_address = wt.wallet_address
+            WHERE w.is_tracked = 1
+              AND wt.asset_id IS NOT NULL
+              AND wt.matched_at >= ?
+            GROUP BY wt.asset_id
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [r[0] for r in rows if r[0]]
 
     # ── Paper trades ───────────────────────────────────────────────────────────
 
@@ -746,12 +800,12 @@ class Database:
         async with self._conn.execute(
             """
             SELECT
-                COUNT(*) as total_closed,
+                COUNT(CASE WHEN status != 'OPEN' THEN 1 END) as total_closed,
                 SUM(CASE WHEN status = 'CLOSED_WIN' THEN 1 ELSE 0 END) as wins,
                 SUM(CASE WHEN status = 'CLOSED_LOSS' THEN 1 ELSE 0 END) as losses,
                 SUM(CASE WHEN pnl > 0 THEN CAST(pnl AS REAL) ELSE 0 END) as gross_profit,
                 SUM(CASE WHEN pnl < 0 THEN ABS(CAST(pnl AS REAL)) ELSE 0 END) as gross_loss,
-                SUM(CAST(pnl AS REAL)) as total_pnl,
+                SUM(CASE WHEN status != 'OPEN' THEN CAST(pnl AS REAL) ELSE 0 END) as total_pnl,
                 COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as open_count
             FROM paper_trades
             """
@@ -846,6 +900,90 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
         return _row_to_snapshot(row) if row else None
+
+    # ── Housekeeping / pruning ─────────────────────────────────────────────────
+
+    async def prune_old_data(
+        self,
+        wallet_trades_retention_days: int = 90,
+        signals_retention_days: int = 7,
+    ) -> Dict[str, int]:
+        """
+        Delete old rows to keep disk usage bounded.
+
+        wallet_trades: prune resolved rows older than retention_days.
+                       Unresolved BUY rows (resolved_price IS NULL) are never pruned
+                       because the FIFO calculator still needs them.
+        signals:       prune acted-on signals older than retention_days.
+        snapshots:     keep one per day; drop sub-daily duplicates beyond 7 days.
+
+        Returns dict of {table: rows_deleted}.
+        """
+        assert self._conn is not None
+        from datetime import timedelta
+        wt_cutoff = (datetime.utcnow() - timedelta(days=wallet_trades_retention_days)).isoformat()
+        sig_cutoff = (datetime.utcnow() - timedelta(days=signals_retention_days)).isoformat()
+
+        # Prune resolved wallet_trades beyond retention window
+        cur = await self._conn.execute(
+            """DELETE FROM wallet_trades
+               WHERE resolved_price IS NOT NULL
+                 AND matched_at < ?""",
+            (wt_cutoff,),
+        )
+        wt_deleted = cur.rowcount
+
+        # Prune acted-on signals beyond retention window
+        cur = await self._conn.execute(
+            """DELETE FROM signals
+               WHERE acted_on = 1
+                 AND generated_at < ?""",
+            (sig_cutoff,),
+        )
+        sig_deleted = cur.rowcount
+
+        # Prune duplicate snapshots: beyond 7 days keep only the latest per day
+        snap_cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        cur = await self._conn.execute(
+            """DELETE FROM portfolio_snapshots
+               WHERE snapshot_date < ?
+                 AND id NOT IN (
+                     SELECT MAX(id) FROM portfolio_snapshots
+                     WHERE snapshot_date < ?
+                     GROUP BY DATE(snapshot_date)
+                 )""",
+            (snap_cutoff, snap_cutoff),
+        )
+        snap_deleted = cur.rowcount
+
+        await self._conn.commit()
+        await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # VACUUM cannot run on an active aiosqlite connection; use a dedicated sync call
+        import sqlite3, asyncio
+        def _vacuum(path: str) -> None:
+            con = sqlite3.connect(path, isolation_level=None)
+            con.execute("VACUUM")
+            con.close()
+        await asyncio.to_thread(_vacuum, str(self._path))
+
+        logger.info(
+            f"Pruned: {wt_deleted} wallet_trades, "
+            f"{sig_deleted} signals, "
+            f"{snap_deleted} snapshots — VACUUM complete"
+        )
+        return {
+            "wallet_trades": wt_deleted,
+            "signals": sig_deleted,
+            "snapshots": snap_deleted,
+        }
+
+    async def db_size_bytes(self) -> int:
+        """Return current database file size in bytes."""
+        import os
+        try:
+            return os.path.getsize(self._path)
+        except OSError:
+            return 0
 
 
 # ── Row converters ─────────────────────────────────────────────────────────────

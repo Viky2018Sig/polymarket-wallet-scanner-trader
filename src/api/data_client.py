@@ -79,6 +79,24 @@ class DataApiClient:
 
     # ── Global trade stream (wallet discovery) ─────────────────────────────────
 
+    async def get_recent_trades_by_asset(
+        self,
+        asset_id: str,
+        limit: int = 5,
+    ) -> List[DataApiTrade]:
+        """
+        Fetch the most recent trades for a specific token/asset ID.
+        Used by the WebSocket trade fetcher to identify the maker_address
+        (proxyWallet) for a WS last_trade_price event.
+        """
+        try:
+            data = await self._get("/trades", params={"asset": asset_id, "limit": limit})
+            raw_list = data if isinstance(data, list) else data.get("data", [])
+            return [DataApiTrade.model_validate(t) for t in raw_list if t]
+        except Exception as exc:
+            logger.debug(f"Data API /trades?asset= error [{asset_id[:12]}…]: {exc}")
+            return []
+
     async def get_recent_trades(
         self,
         limit: int = 100,

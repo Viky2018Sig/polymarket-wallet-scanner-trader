@@ -186,7 +186,7 @@ async def _run_scan(
 @click.option("--once", is_flag=True, default=False,
               help="Run a single scan cycle instead of continuous loop.")
 def monitor(once: bool) -> None:
-    """Monitor tracked wallets for new signals."""
+    """Monitor tracked wallets for new signals (30-min polling, legacy)."""
     asyncio.run(_run_monitor(once))
 
 
@@ -197,7 +197,6 @@ async def _run_monitor(once: bool) -> None:
     from src.storage.database import Database
 
     async with Database() as db, DataApiClient() as clob:
-        # Restore current bankroll from snapshot
         snapshot = await db.get_latest_snapshot()
         bankroll = Decimal(str(settings.starting_bankroll))
         if snapshot:
@@ -210,6 +209,56 @@ async def _run_monitor(once: bool) -> None:
             logger.info(f"Monitor cycle complete: {len(signals)} signals generated")
         else:
             await engine.run_continuous()
+
+
+# ── realtime ──────────────────────────────────────────────────────────────────
+
+@cli.command()
+def realtime() -> None:
+    """
+    Real-time wallet monitor — WebSocket mode (~200ms detection latency).
+
+    Runs five concurrent workers:
+      ws_worker         — CLOB WebSocket, receives last_trade_price events (~50ms)
+      trade_fetcher     — REST /trades?asset_id=X per event, finds tracked maker
+      signal_processor  — applies guardrails and writes signals to DB
+      housekeep_worker  — prunes old DB rows every 6 hours
+      unfollow_checker  — refreshes subscriptions and open-keys every 30 min
+
+    Guardrails applied per signal:
+      1. BUY in 0.01–0.15 price range
+      2. Market has ≥ MIN_MARKET_SECONDS_REMAINING before close
+      3. Current ask ≤ signal_price × MAX_COPY_PRICE_MULTIPLIER
+    """
+    asyncio.run(_run_realtime())
+
+
+async def _run_realtime() -> None:
+    from decimal import Decimal
+    from src.api.data_client import DataApiClient
+    from src.api.clob_client import ClobClient
+    from src.trader.realtime_monitor import RealtimeMonitor
+    from src.storage.database import Database
+
+    logger.info(
+        f"Starting realtime monitor — WebSocket mode "
+        f"(ceiling={settings.max_copy_price_multiplier}×, "
+        f"min_remaining={settings.min_market_seconds_remaining}s)"
+    )
+
+    async with Database() as db, DataApiClient() as data, ClobClient() as clob:
+        snapshot = await db.get_latest_snapshot()
+        bankroll = Decimal(str(settings.starting_bankroll))
+        if snapshot:
+            bankroll = snapshot.bankroll
+
+        monitor = RealtimeMonitor(
+            data_client=data,
+            clob_client=clob,
+            db=db,
+            bankroll=bankroll,
+        )
+        await monitor.run()
 
 
 # ── paper-trade ────────────────────────────────────────────────────────────────
@@ -376,6 +425,80 @@ async def _run_notify(test: bool) -> None:
     else:
         logger.error("Failed to send performance report to Telegram")
         raise SystemExit(1)
+
+
+# ── live-trade ────────────────────────────────────────────────────────────────
+
+@cli.command(name="live-trade")
+@click.option("--once", is_flag=True, default=False,
+              help="Run a single cycle instead of continuous loop.")
+@click.option("--status", is_flag=True, default=False,
+              help="Print portfolio status and exit (no trading).")
+@click.option("--interval", default=settings.scan_interval_minutes, show_default=True,
+              type=int, help="Minutes between live-trade cycles.")
+def live_trade(once: bool, status: bool, interval: int) -> None:
+    """Execute real CLOB orders from scanner signals (live trading)."""
+    asyncio.run(_run_live_trade(once, status, interval))
+
+
+async def _run_live_trade(once: bool, show_status: bool, interval: int) -> None:
+    from src.trader.live_trader import LiveTrader, init_live_balance_from_clob
+    from src.storage.database import Database
+
+    async with Database() as db:
+        trader = LiveTrader(db=db)
+
+        if show_status:
+            trader.print_status()
+            return
+
+        if once:
+            await trader.run_live_trade_cycle()
+        else:
+            logger.info(
+                f"Live trader running (cycle every {interval} min) — "
+                f"credentials: {settings.live_env_file}"
+            )
+            balance = await init_live_balance_from_clob()
+            if balance is not None:
+                logger.info(f"Wallet USDC balance: ${balance:.4f}")
+                if balance < 1.0:
+                    logger.warning(
+                        f"Wallet balance ${balance:.4f} is below minimum order size. "
+                        "Deposit USDC to the proxy wallet before live trading."
+                    )
+            else:
+                logger.warning("Could not fetch live wallet balance — check credentials")
+            while True:
+                try:
+                    await trader.run_live_trade_cycle()
+                except Exception as exc:
+                    logger.error(f"Live trade cycle error: {exc}")
+                await asyncio.sleep(interval * 60)
+
+
+# ── prune ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+def prune() -> None:
+    """Prune old DB rows to reclaim disk space, then VACUUM."""
+    asyncio.run(_run_prune())
+
+
+async def _run_prune() -> None:
+    from src.storage.database import Database
+
+    async with Database() as db:
+        size_before = await db.db_size_bytes() / 1_048_576
+        deleted = await db.prune_old_data(
+            wallet_trades_retention_days=settings.wallet_trades_retention_days,
+            signals_retention_days=settings.signals_retention_days,
+        )
+        size_after = await db.db_size_bytes() / 1_048_576
+        logger.info(
+            f"Prune complete — {size_before:.1f} MB → {size_after:.1f} MB "
+            f"(saved {size_before - size_after:.1f} MB) | deleted: {deleted}"
+        )
 
 
 # ── init-db (utility) ─────────────────────────────────────────────────────────
