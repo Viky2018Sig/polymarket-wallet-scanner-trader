@@ -37,10 +37,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiosqlite
 import httpx
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS fast_trades (
     opened_at       TEXT NOT NULL,
     closed_at       TEXT,
     notes           TEXT,
+    order_id        TEXT,
     UNIQUE(market_id, wallet_followed)
 );
 
@@ -109,6 +111,10 @@ class FastCopier:
         max_position_pct: float = 0.0025,
         kelly_fraction: float = 0.25,
         lookback_days: int = 14,
+        live_mode: bool = False,
+        live_env_file: str = "",
+        live_max_bet: float = 2.0,
+        live_slippage: float = 0.005,
     ) -> None:
         self._scanner_db = scanner_db_path
         self._fast_db = fast_db_path
@@ -117,6 +123,11 @@ class FastCopier:
         self._max_pos_pct = max_position_pct
         self._kelly_frac = kelly_fraction
         self._lookback_days = lookback_days
+        self._live_mode = live_mode
+        self._live_env_file = live_env_file
+        self._live_max_bet = live_max_bet
+        self._live_slippage = live_slippage
+        self._clob_client: Any = None
 
         # asset_id → (wallet_address_lower, market_id)
         self._asset_map: Dict[str, Tuple[str, str]] = {}
@@ -150,6 +161,12 @@ class FastCopier:
             if stmt:
                 await self._conn.execute(stmt)
         await self._conn.commit()
+        # Additive migration: add order_id column to existing DBs
+        try:
+            await self._conn.execute("ALTER TABLE fast_trades ADD COLUMN order_id TEXT")
+            await self._conn.commit()
+        except Exception:
+            pass  # column already exists
         logger.info(f"Fast DB ready: {self._fast_db}")
 
     async def _load_scanner_data(self) -> None:
@@ -204,6 +221,84 @@ class FastCopier:
         )
         self._open_keys = {(r[0], r[1]) for r in rows}
         logger.info(f"{len(self._open_keys)} open positions loaded from fast DB")
+
+    # ── Live order helpers ────────────────────────────────────────────────────
+
+    def _build_live_client(self) -> Any:
+        """Build py-clob-client-v2 ClobClient from live_env_file."""
+        try:
+            from py_clob_client_v2.client import ClobClient
+            from py_clob_client_v2.clob_types import ApiCreds
+        except ImportError:
+            raise RuntimeError(
+                "py-clob-client-v2 not installed. Run: pip install py-clob-client-v2"
+            )
+        env: Dict[str, str] = {}
+        env_path = Path(self._live_env_file)
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if line and "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    env[k.strip()] = v.strip()
+        for key in ("PK", "PROXY_WALLET", "CLOB_API_KEY", "CLOB_SECRET", "CLOB_PASSPHRASE", "SIG_TYPE"):
+            val = os.environ.get(key)
+            if val:
+                env[key] = val
+        pk = env.get("PK", "")
+        if not pk:
+            raise RuntimeError(f"PK not found in {self._live_env_file}")
+        sig_type = int(env.get("SIG_TYPE", "0"))
+        creds = ApiCreds(
+            api_key=env.get("CLOB_API_KEY", ""),
+            api_secret=env.get("CLOB_SECRET", ""),
+            api_passphrase=env.get("CLOB_PASSPHRASE", ""),
+        )
+        kwargs: Dict[str, Any] = dict(chain_id=137, key=pk, creds=creds, signature_type=sig_type)
+        proxy_wallet = env.get("PROXY_WALLET", "")
+        if sig_type in (1, 2, 3) and proxy_wallet:
+            kwargs["funder"] = proxy_wallet
+        return ClobClient("https://clob.polymarket.com", **kwargs)
+
+    async def _place_live_order(self, asset_id: str, price: float, dollar_amount: float) -> str:
+        """Place a real FOK BUY order on the CLOB via Brazil proxy. Returns order_id or ''."""
+        size = round(min(dollar_amount, self._live_max_bet), 2)
+        if size < 1.0:
+            logger.debug(f"Live order skipped: size ${size:.2f} < $1 minimum")
+            return ""
+        limit_price = round(min(price * (1.0 + self._live_slippage), 0.99), 4)
+
+        def _place_sync() -> Dict[str, Any]:
+            if self._clob_client is None:
+                self._clob_client = self._build_live_client()
+            from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+            order_args = MarketOrderArgsV2(
+                token_id=asset_id,
+                amount=size,
+                side="BUY",
+                price=limit_price,
+                order_type=OrderType.FOK,
+            )
+            return self._clob_client.create_and_post_market_order(
+                order_args, order_type=OrderType.FOK
+            )
+
+        try:
+            resp = await asyncio.to_thread(_place_sync)
+            order_id = (
+                resp.get("orderID", resp.get("id", ""))
+                if isinstance(resp, dict)
+                else ""
+            )
+            logger.info(
+                f"LIVE BUY: asset={asset_id[:16]}… price={limit_price:.4f} "
+                f"size=${size:.2f} order_id={order_id[:16] if order_id else '?'}"
+            )
+            return order_id or ""
+        except Exception as exc:
+            logger.error(f"Live order failed: asset={asset_id[:16]}… {exc}")
+            self._clob_client = None  # force rebuild on next attempt
+            return ""
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -418,6 +513,17 @@ class FastCopier:
                 f"price={price:.4f} size=${dollar_amount:.2f} "
                 f"pf={pf:.1f}x wr={win_rate:.1%}"
             )
+
+            if self._live_mode:
+                order_id = await self._place_live_order(asset_id, price, dollar_amount)
+                if order_id:
+                    await self._conn.execute(
+                        "UPDATE fast_trades SET order_id=? "
+                        "WHERE market_id=? AND wallet_followed=?",
+                        (order_id, market_id, wallet),
+                    )
+                    await self._conn.commit()
+
             return True
 
         except Exception as exc:

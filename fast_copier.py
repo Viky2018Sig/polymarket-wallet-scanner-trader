@@ -93,6 +93,29 @@ def _parse_args() -> argparse.Namespace:
         default=str(_ROOT / "logs" / "fast_copier.log"),
         help="Log file path (set to '' to disable file logging)",
     )
+    p.add_argument(
+        "--live",
+        action="store_true",
+        default=False,
+        help="Enable live CLOB order placement (paper-only if not set)",
+    )
+    p.add_argument(
+        "--live-env",
+        default="/root/copybot-live/polymarket-copybot/.env",
+        help="Path to .env with live trading credentials (PK, CLOB_API_KEY, etc.)",
+    )
+    p.add_argument(
+        "--live-max-bet",
+        type=float,
+        default=2.0,
+        help="Max USD per single live order",
+    )
+    p.add_argument(
+        "--live-slippage",
+        type=float,
+        default=0.005,
+        help="Slippage buffer on limit price (0.005 = 0.5%%)",
+    )
     return p.parse_args()
 
 
@@ -121,7 +144,8 @@ def main() -> None:
     logger.info(
         f"FastCopier config — scanner_db={args.scanner_db} "
         f"fast_db={args.fast_db} max_price={args.max_price} "
-        f"bankroll=${args.bankroll:,.2f}"
+        f"bankroll=${args.bankroll:,.2f} "
+        f"live={'ON max_bet=$' + str(args.live_max_bet) if args.live else 'OFF (paper only)'}"
     )
 
     copier = FastCopier(
@@ -132,6 +156,10 @@ def main() -> None:
         max_position_pct=args.max_pos_pct,
         kelly_fraction=args.kelly,
         lookback_days=args.lookback_days,
+        live_mode=args.live,
+        live_env_file=args.live_env,
+        live_max_bet=args.live_max_bet,
+        live_slippage=args.live_slippage,
     )
 
     try:
