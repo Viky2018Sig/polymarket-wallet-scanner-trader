@@ -46,6 +46,8 @@ def shorten(addr: str, n: int = 6) -> str:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--bankroll", type=float, default=750.0)
+    p.add_argument("--live-bankroll", type=float, default=100.0,
+                   help="Starting live USDC balance (actual deposit amount)")
     p.add_argument("--fast-db", default=str(_ROOT / "fast_copier.db"))
     p.add_argument("--closed-limit", type=int, default=30,
                    help="Max closed trades shown in detail table")
@@ -127,6 +129,9 @@ def main():
     live_pnl_sign = "+" if live_realised_pnl >= 0 else ""
     live_closed = live_wins + live_losses
     live_win_rate = (live_wins / live_closed * 100) if live_closed > 0 else 0.0
+    live_portfolio_value = args.live_bankroll + live_realised_pnl
+    live_roi_pct = (live_realised_pnl / args.live_bankroll) * 100
+    live_roi_sign = "+" if live_roi_pct >= 0 else ""
 
     summary = (
         f"<b>⚡ FastCopier Report</b> — {now}\n"
@@ -137,6 +142,9 @@ def main():
         f"\n"
         f"💵 Live realised P&amp;L: <b>{live_pnl_sign}${live_realised_pnl:,.2f}</b>  "
         f"({live_wins}✓ / {live_losses}✗,  {live_win_rate:.0f}% hit rate)\n"
+        f"💼 Live portfolio:    <b>${live_portfolio_value:,.2f}</b>  ({live_roi_sign}{live_roi_pct:.2f}%)  "
+        f"(started ${args.live_bankroll:,.0f})\n"
+        f"\n"
         f"💰 Paper realised P&amp;L: <b>{pnl_sign}${realised_pnl:,.2f}</b>  ({roi_sign}{roi_pct:.2f}%)\n"
         f"🏦 Paper portfolio:   <b>${portfolio_value:,.2f}</b>  (started ${args.bankroll:,.0f})\n"
         f"\n"
