@@ -10,13 +10,15 @@ A strategy engine that scans Polymarket wallets for proven high-RR traders, copi
 2. [Architecture](#architecture)
 3. [FastCopier — Sub-Second Mode](#fastcopier--sub-second-mode)
 4. [VPS Selection Guide (Vultr)](#vps-selection-guide-vultr)
-5. [Setup](#setup)
-6. [Running the System](#running-the-system)
-7. [Cron Jobs](#cron-jobs)
-8. [Configuration Reference](#configuration-reference)
-9. [Database Schema](#database-schema)
-10. [Telegram Notifications](#telegram-notifications)
-11. [Troubleshooting](#troubleshooting)
+5. [Full Server Setup (Step-by-Step)](#full-server-setup-step-by-step)
+6. [Systemd Services](#systemd-services)
+7. [WireGuard VPN (Live Trading)](#wireguard-vpn-live-trading)
+8. [Cron Jobs](#cron-jobs)
+9. [Running the System](#running-the-system)
+10. [Configuration Reference](#configuration-reference)
+11. [Database Schema](#database-schema)
+12. [Telegram Notifications](#telegram-notifications)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -327,200 +329,358 @@ Not required. IPv4 is fine.
 
 Add your SSH public key during setup for passwordless login.
 
-### Server Setup After Provisioning
+---
+
+## Full Server Setup (Step-by-Step)
+
+This is the exact sequence used to provision the NJ Vultr VPS. Follow these steps in order on a fresh Ubuntu 22.04 server.
+
+### 1. System Packages
 
 ```bash
-# SSH in
-ssh root@<your-vultr-ip>
-
-# Update packages
 apt update && apt upgrade -y
+apt install -y python3.11 python3.11-venv python3.11-dev \
+               git sqlite3 wireguard curl rsync ufw
+```
 
-# Install Python 3.10+ and pip
-apt install -y python3 python3-pip python3-venv git
+### 2. Clone Repository
 
-# Clone the repo
+```bash
 git clone https://github.com/Viky2018Sig/polymarket-wallet-scanner-trader.git
-cd polymarket-wallet-scanner-trader
+cd /root/polymarket-wallet-scanner-trader
+```
 
-# Install dependencies
-pip3 install -r requirements.txt
+### 3. Python Virtual Environment
 
-# Verify the latency improvement
-python3 -c "
+```bash
+python3.11 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
+```
+
+> **Always use `.venv/bin/python3` (not the system `python3`) for all commands on this server.** The venv contains all dependencies and is what the systemd services and cron jobs use.
+
+### 4. Configure `.env`
+
+```bash
+cp .env.example .env
+nano .env   # or vim .env
+```
+
+Minimum required values:
+
+```env
+STARTING_BANKROLL=750
+KELLY_FRACTION=0.25
+MAX_POSITION_PCT=0.005
+TELEGRAM_BOT_TOKEN=<your-bot-token>
+TELEGRAM_CHAT_ID=<your-chat-id>
+```
+
+To create a Telegram bot: message **@BotFather**, send `/newbot`, copy the token. Get your chat ID from `https://api.telegram.org/bot<TOKEN>/getUpdates` after sending the bot a message.
+
+### 5. Sync Scanner Database from Existing VPS
+
+The FastCopier reads wallet scores and trade history from `polymarket_scanner.db`. Copy it from your existing scanner VPS (only needs to be done once — the 4h cron keeps it refreshed):
+
+```bash
+# Run this on the NEW VPS (pulls from old VPS)
+rsync -avz root@<old-vps-ip>:/root/polymarket-wallet-scanner-trader/polymarket_scanner.db \
+  /root/polymarket-wallet-scanner-trader/polymarket_scanner.db
+```
+
+### 6. Initialise Databases
+
+```bash
+.venv/bin/python3 main.py init-db
+```
+
+This creates `polymarket_scanner.db` schema (if not already present from the rsync) and `fast_copier.db`.
+
+### 7. Verify Latency
+
+```bash
+.venv/bin/python3 -c "
 import httpx, time
 times = []
 for _ in range(5):
     t = time.time()
     httpx.get('https://clob.polymarket.com/health')
     times.append((time.time()-t)*1000)
-print(f'CLOB RTT: avg={sum(times)/len(times):.0f}ms min={min(times):.0f}ms')
+print(f'CLOB RTT: avg={sum(times)/len(times):.0f}ms  min={min(times):.0f}ms')
 "
-# Expected: avg=10-20ms on NJ Vultr (vs 274ms from Brazil)
+# Expected on NJ Vultr: avg=10-20ms min=8ms
+# If >100ms, check your region — you may be on the wrong datacenter
 ```
 
-### Deploying FastCopier on the New VPS
-
-The FastCopier only needs:
-1. The Python code (from git)
-2. A copy of `polymarket_scanner.db` from your existing scanner (for wallet scores)
+### 8. Create Logs Directory
 
 ```bash
-# On your existing VPS — copy the scanner DB to the new server
-rsync -avz polymarket_scanner.db root@<new-vultr-ip>:/root/polymarket-wallet-scanner-trader/
+mkdir -p /root/polymarket-wallet-scanner-trader/logs
+```
 
-# On the new server — run FastCopier
+### 9. Install Systemd Services
+
+See [Systemd Services](#systemd-services) section below.
+
+### 10. Install WireGuard VPN
+
+Required **only for live trading** (geo-block bypass for `POST /order`). Not needed for paper trading.
+See [WireGuard VPN (Live Trading)](#wireguard-vpn-live-trading) section below.
+
+### 11. Install Cron Jobs
+
+See [Cron Jobs](#cron-jobs) section below.
+
+### 12. Test Telegram
+
+```bash
 cd /root/polymarket-wallet-scanner-trader
-nohup python3 fast_copier.py \
-  --bankroll 2000 \
-  --max-price 0.20 \
-  --log-file logs/fast_copier.log >> /dev/null 2>&1 &
-
-echo "FastCopier PID: $!"
-```
-
-The scanner DB needs to be refreshed periodically so the asset map stays current. Set up a cron on the new server to pull it every 4 hours:
-
-```bash
-# On new VPS — crontab -e
-0 */4 * * * rsync -az root@<old-vps-ip>:/root/polymarket-wallet-scanner-trader/polymarket_scanner.db \
-  /root/polymarket-wallet-scanner-trader/polymarket_scanner.db
-```
-
-Or alternatively, run the full scanner on the new VPS and let it build its own DB from scratch:
-
-```bash
-# Run the scanner once to build wallet history (takes ~1–2 hours first time)
-python3 main.py scan --max-pages 200 --top-n 50
-
-# Then start both monitors
-nohup python3 main.py realtime >> logs/realtime.log 2>&1 &
-nohup python3 fast_copier.py >> logs/fast_copier.log 2>&1 &
+.venv/bin/python3 fast_report.py --bankroll 750
 ```
 
 ---
 
-## Setup
+## Systemd Services
 
-### 1. Clone and Install
+Using systemd ensures both services auto-start on boot and restart automatically if they crash.
 
-```bash
-git clone https://github.com/Viky2018Sig/polymarket-wallet-scanner-trader.git
-cd polymarket-wallet-scanner-trader
-pip3 install -r requirements.txt
+### FastCopier Service
+
+Create `/etc/systemd/system/polymarket-fast-copier.service`:
+
+```ini
+[Unit]
+Description=Polymarket FastCopier (sub-second, NJ)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-wallet-scanner-trader
+ExecStart=/root/polymarket-wallet-scanner-trader/.venv/bin/python3 fast_copier.py \
+    --bankroll 750 \
+    --max-price 0.20 \
+    --max-pos-pct 0.005 \
+    --kelly 0.25 \
+    --log-file logs/fast_copier.log
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/polymarket-wallet-scanner-trader/logs/fast_copier.log
+StandardError=append:/root/polymarket-wallet-scanner-trader/logs/fast_copier.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-### 2. Configure
+> Adjust `--bankroll` to match your actual starting capital and `--max-pos-pct` to the fraction per trade (0.005 = 0.5%, so $3.75 per trade on $750).
 
-```bash
-cp .env.example .env
+### Realtime Monitor Service
+
+Create `/etc/systemd/system/polymarket-realtime.service`:
+
+```ini
+[Unit]
+Description=Polymarket Realtime Monitor (NJ)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-wallet-scanner-trader
+ExecStart=/root/polymarket-wallet-scanner-trader/.venv/bin/python3 main.py realtime
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/polymarket-wallet-scanner-trader/logs/realtime.log
+StandardError=append:/root/polymarket-wallet-scanner-trader/logs/realtime.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-Edit `.env`:
-
-```env
-STARTING_BANKROLL=2000
-KELLY_FRACTION=0.25
-MAX_POSITION_PCT=0.0025
-TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRstuVWXyz
-TELEGRAM_CHAT_ID=-100123456789
-```
-
-### 3. Create the Telegram Bot
-
-1. Message **@BotFather** on Telegram
-2. Send `/newbot` → copy the **bot token**
-3. Add the bot to your channel/group (or start a DM)
-4. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` after sending a message to get your **chat ID**
-5. For a private channel, the chat ID starts with `-100`
-
-### 4. Initialise the Database
+### Enable and Start
 
 ```bash
-python3 main.py init-db
-```
+systemctl daemon-reload
+systemctl enable polymarket-fast-copier polymarket-realtime
+systemctl start  polymarket-fast-copier polymarket-realtime
 
-### 5. Test Telegram
+# Verify both are running
+systemctl status polymarket-fast-copier polymarket-realtime
 
-```bash
-python3 main.py notify --test
+# Tail live logs
+journalctl -u polymarket-fast-copier -f
+journalctl -u polymarket-realtime -f
+
+# Restart after config changes
+systemctl restart polymarket-fast-copier
 ```
 
 ---
 
-## Running the System
+## WireGuard VPN (Live Trading)
 
-### Standard Pipeline (Scanner + RealtimeMonitor)
+**Paper trading does not need a VPN.** All read-only API calls (WebSocket, GET /activity, GET /book) are geo-unblocked. The VPN is only required when placing live orders (`POST /order` to the CLOB) from a US IP.
 
-```bash
-# Step 1 — Discover and score wallets (run once, then weekly)
-python3 main.py scan --max-pages 200 --top-n 50
+A **split-tunnel** is used so only Polymarket's CLOB API IPs route through the VPN. SSH and all other traffic stays direct — you won't lose your SSH session if the VPN drops.
 
-# Re-score wallets already in DB (fast, runs FIFO PnL, no API re-fetch)
-python3 main.py scan --skip-discovery
-
-# Step 2 — Start real-time signal monitor
-nohup python3 main.py realtime >> logs/realtime.log 2>&1 &
-
-# Step 3 — Start paper trader (resolves open positions every 30 min)
-nohup python3 main.py paper-trade >> logs/paper-trade.log 2>&1 &
-```
-
-### FastCopier Pipeline (Sub-Second, Separate DB)
+### 1. Generate WireGuard Keys on the Server
 
 ```bash
-# Requires scanner DB to exist (run scan first, or rsync from another VPS)
-nohup python3 fast_copier.py \
-  --bankroll 2000 \
-  --max-price 0.20 \
-  --log-file logs/fast_copier.log >> /dev/null 2>&1 &
+wg genkey | tee /etc/wireguard/private.key | wg pubkey > /etc/wireguard/public.key
+chmod 600 /etc/wireguard/private.key
+cat /etc/wireguard/public.key   # copy this — you'll need it for Mullvad
 ```
 
-### One-Off Commands
+### 2. Register Key with Mullvad
+
+1. Go to **mullvad.net/en/account/wireguard-config**
+2. Select platform: **Linux**
+3. Click **Import key** and paste the public key from step 1
+4. Select exit location: **UK → London → any server** (e.g. `gb-lon-wg-001`)
+5. Download the generated `.conf` file
+
+### 3. Create Split-Tunnel Config
+
+Create `/etc/wireguard/wg0.conf` using values from the downloaded Mullvad config:
+
+```ini
+[Interface]
+PrivateKey = <paste PrivateKey from downloaded Mullvad config>
+Address = <paste Address from downloaded Mullvad config>
+# No DNS line — split-tunnel only, DNS stays local
+
+[Peer]
+PublicKey = <paste PublicKey from downloaded Mullvad config>
+# Split-tunnel: ONLY Polymarket CLOB Cloudflare IPs go through VPN
+# clob.polymarket.com resolves to 104.18.34.205
+AllowedIPs = 104.18.34.205/32, 172.64.153.51/32
+Endpoint = <paste Endpoint from downloaded Mullvad config>
+PersistentKeepalive = 25
+```
 
 ```bash
-python3 main.py dashboard --live     # Auto-refreshing terminal dashboard
-python3 main.py dashboard            # Single snapshot
-python3 main.py report               # P&L report to stdout
-python3 main.py report --json        # P&L report as JSON
-python3 main.py notify               # Send current performance to Telegram
-python3 main.py prune                # Prune old DB rows + VACUUM
+chmod 600 /etc/wireguard/wg0.conf
 ```
 
-### Checking Running Processes
+### 4. Bring Up the Tunnel
 
 ```bash
-ps aux | grep "python3 main\|fast_copier" | grep -v grep
+wg-quick up wg0
 
-# Tail logs
-tail -f logs/realtime.log
-tail -f logs/fast_copier.log
+# Verify — should show handshake and correct AllowedIPs
+wg show wg0
 
-# Stop a process
-kill <PID>
+# Verify CLOB routes through VPN
+ip route get 104.18.34.205
+# Expected: "104.18.34.205 dev wg0 ..."
+
+# Enable on boot
+systemctl enable wg-quick@wg0
 ```
+
+### 5. Verify Geo-Block Status
+
+```bash
+# This checks the CLOB API specifically (routes through VPN)
+curl -s https://clob.polymarket.com/health
+# Should respond with {"status":"ok"} from a UK IP
+
+# The main polymarket.com website is NOT in the tunnel (that's correct)
+```
+
+### Mullvad on Your Local Machine
+
+Mullvad allows up to 5 devices on one account. To access Polymarket on your laptop/desktop:
+
+1. Download the **Mullvad app** from mullvad.net/download (Windows/Mac/Linux)
+2. Log in with your account number
+3. Connect to any **UK or EU** server
+4. Polymarket.com will load immediately
+
+The server's WireGuard key and your desktop Mullvad app use separate device slots — they don't interfere.
 
 ---
 
 ## Cron Jobs
 
-```bash
-# Edit crontab
-crontab -e
+Install with `crontab -e`. Note: always use `.venv/bin/python3`, not `python3`.
 
-# Add these three lines:
-7 * * * *    cd /root/polymarket-wallet-scanner-trader && python3 main.py notify >> logs/notify.log 2>&1
-23 */4 * * * cd /root/polymarket-wallet-scanner-trader && python3 main.py scan --skip-discovery >> logs/scan.log 2>&1
-47 4 * * *   cd /root/polymarket-wallet-scanner-trader && python3 main.py prune >> logs/prune.log 2>&1
+```bash
+# Hourly FastCopier report to Telegram (fast_copier.db stats)
+0 * * * *    cd /root/polymarket-wallet-scanner-trader && .venv/bin/python3 fast_report.py --bankroll 750 >> logs/fast_report.log 2>&1
+
+# Hourly scanner notify to Telegram (main scanner DB stats)
+7 * * * *    cd /root/polymarket-wallet-scanner-trader && .venv/bin/python3 main.py notify >> logs/notify.log 2>&1
+
+# Every 4h: refresh FIFO resolved prices (required for paper trade resolution)
+23 */4 * * * cd /root/polymarket-wallet-scanner-trader && .venv/bin/python3 main.py scan --skip-discovery >> logs/scan.log 2>&1
+
+# Daily at 4:47 AM: prune old DB rows + VACUUM
+47 4 * * *   cd /root/polymarket-wallet-scanner-trader && .venv/bin/python3 main.py prune >> logs/prune.log 2>&1
 ```
 
 | Job | Schedule | Purpose |
 |-----|----------|---------|
-| `notify` | Every hour at :07 | Send Telegram performance report |
-| `scan --skip-discovery` | Every 4h at :23 | Refresh FIFO resolved prices → enables paper trade position resolution |
-| `prune` | 4:47 AM daily | Delete old rows, VACUUM SQLite → bounds disk usage |
+| `fast_report.py` | Every hour at :00 | FastCopier P&L summary → Telegram |
+| `notify` | Every hour at :07 | Scanner portfolio report → Telegram |
+| `scan --skip-discovery` | Every 4h at :23 | FIFO PnL refresh → enables position resolution |
+| `prune` | 4:47 AM daily | Delete old rows, VACUUM SQLite → bounds disk |
 
-**Critical:** paper trades are resolved by detecting wallet exits via FIFO-resolved `resolved_price` values, which are only set when `scan --skip-discovery` runs. The every-4-hour cron keeps resolution lag under 4 hours.
+**Critical:** paper trades are resolved by detecting wallet exits via FIFO-resolved `resolved_price` values, which are only set when `scan --skip-discovery` runs. The 4h cron keeps resolution lag under 4 hours.
+
+---
+
+## Running the System
+
+### Managing Services
+
+```bash
+# Status
+systemctl status polymarket-fast-copier polymarket-realtime
+
+# Restart
+systemctl restart polymarket-fast-copier
+systemctl restart polymarket-realtime
+
+# Tail live logs
+journalctl -u polymarket-fast-copier -f --no-pager
+journalctl -u polymarket-realtime -f --no-pager
+
+# Or tail log files directly
+tail -f /root/polymarket-wallet-scanner-trader/logs/fast_copier.log
+tail -f /root/polymarket-wallet-scanner-trader/logs/realtime.log
+```
+
+### One-Off Commands
+
+```bash
+cd /root/polymarket-wallet-scanner-trader
+
+.venv/bin/python3 main.py dashboard --live     # Auto-refreshing terminal dashboard
+.venv/bin/python3 main.py report               # P&L report to stdout
+.venv/bin/python3 main.py notify               # Send scanner performance to Telegram
+.venv/bin/python3 fast_report.py --bankroll 750  # Send FastCopier report now
+.venv/bin/python3 main.py scan --skip-discovery  # Refresh FIFO PnL manually
+.venv/bin/python3 main.py prune                # Prune old DB rows + VACUUM
+```
+
+### Quick FastCopier Stats
+
+```bash
+sqlite3 fast_copier.db "
+SELECT
+  status,
+  COUNT(*) as trades,
+  ROUND(SUM(dollar_amount),2) as deployed,
+  ROUND(SUM(COALESCE(pnl,0)),2) as pnl
+FROM fast_trades GROUP BY status;
+"
+```
 
 ---
 
@@ -613,7 +773,32 @@ All databases run in **WAL mode** (write-ahead logging) with `busy_timeout=30000
 
 ## Telegram Notifications
 
-Hourly update (sent at :07 each hour by `python3 main.py notify`):
+Two separate hourly reports fire from cron:
+
+### FastCopier Report (`fast_report.py` — sent at :00)
+
+Tracks positions in `fast_copier.db`:
+
+```
+⚡ FastCopier Report — 2026-05-15 06:00 UTC
+━━━━━━━━━━━━━━━━━━━━
+📂 Open positions:    89  ($333.75 deployed)
+✅ Closed trades:     52  (31✓ / 21✗,  60% hit rate)
+
+💰 Realised P&L:     +$221.44  (+29.53%)
+🏦 Portfolio value:   $971.44  (started $750)
+
+🕐 Running since 2026-05-15 05:35 UTC
+```
+
+Send manually at any time:
+```bash
+.venv/bin/python3 fast_report.py --bankroll 750
+```
+
+### Scanner Report (`main.py notify` — sent at :07)
+
+Tracks the full scanner pipeline (paper_trades table in `polymarket_scanner.db`):
 
 ```
 🤖 Polymarket Scanner — Hourly Update
@@ -623,26 +808,18 @@ Hourly update (sent at :07 each hour by `python3 main.py notify`):
   Starting Capital:    $2,000.00
   Realised P&L:   📈 +$1,733.90 (+86.7%)
   Bankroll (realised): $3,733.90
-  Unrealised P&L: 📉   -$30.19
 
 📊 Performance
   Closed Trades:  234  (28W / 206L)
   Win Rate:       11.9%
   Profit Factor:  ✅ 3.85
-  Gross Profit:   +$2,108.44
-  Gross Loss:     -$547.54
-  Max Drawdown:   ✅ 8.3%
   Open Positions: 25
   Tracked Wallets: 16
-
-🏆 Top Trades by Profit
-  78c1769b | 0xe9076a… | +$18.40 | 0.04→0.98
-  ...
 
 🕐 2026-05-15 02:00 UTC
 ```
 
-Real-time signal alerts are sent by the RealtimeMonitor when a tracked wallet opens a new low-price position.
+Real-time signal alerts are also sent by the RealtimeMonitor when a tracked wallet opens a new low-price position.
 
 ---
 
