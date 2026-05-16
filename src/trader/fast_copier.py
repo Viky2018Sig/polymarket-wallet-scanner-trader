@@ -120,6 +120,9 @@ class FastCopier:
         live_slippage: float = 0.005,
         profit_lock_at: float = 2.0,
         profit_lock_trail: float = 0.50,
+        fast_exit_at: float = 0.0,
+        fast_exit_trail: float = 0.50,
+        fast_exit_window: int = 60,
     ) -> None:
         self._scanner_db = scanner_db_path
         self._fast_db = fast_db_path
@@ -132,8 +135,12 @@ class FastCopier:
         self._live_env_file = live_env_file
         self._live_max_bet = live_max_bet
         self._live_slippage = live_slippage
-        self._profit_lock_at = profit_lock_at    # activate trailing stop at N× entry
-        self._profit_lock_trail = profit_lock_trail  # sell when bid falls to this fraction of peak
+        self._profit_lock_at = profit_lock_at
+        self._profit_lock_trail = profit_lock_trail
+        # Fast-exit: trailing stop that applies only to young positions
+        self._fast_exit_at = fast_exit_at        # N× entry to arm (0 = disabled)
+        self._fast_exit_trail = fast_exit_trail  # sell when bid drops to this fraction of peak
+        self._fast_exit_window = fast_exit_window  # minutes a position is considered "young"
         self._clob_client: Any = None
 
         # asset_id → (wallet_address_lower, market_id)
@@ -518,6 +525,10 @@ class FastCopier:
         if price <= 0 or price > self._max_entry:
             return False
 
+        # Skip the 0.10–0.15 bucket — insufficient R:R for observed win rates
+        if 0.10 <= price < 0.15:
+            return False
+
         if tx_hash:
             self._seen_ids.add(tx_hash)
 
@@ -755,7 +766,7 @@ class FastCopier:
             try:
                 rows = await self._conn.execute_fetchall(
                     "SELECT id, asset_id, entry_price, shares, dollar_amount, "
-                    "market_id, wallet_followed "
+                    "market_id, wallet_followed, COALESCE(peak_price, 0), opened_at "
                     "FROM fast_trades WHERE status='OPEN'"
                 )
                 if not rows:
@@ -765,13 +776,14 @@ class FastCopier:
                 price_map = await self._fetch_prices(unique_assets)
 
                 wins = losses = 0
-                for trade_id, asset_id, entry_price, shares, dollar_amount, market_id, wallet in rows:
+                now = datetime.utcnow().isoformat()
+                for (trade_id, asset_id, entry_price, shares, dollar_amount,
+                     market_id, wallet, peak_price, opened_at) in rows:
                     _, ask = price_map.get(asset_id, (None, None))
                     if ask is None:
                         continue
 
                     ask_d = Decimal(str(ask))
-                    now = datetime.utcnow().isoformat()
 
                     if ask_d >= self._WIN_THRESHOLD:
                         exit_p = float(self._WIN_THRESHOLD)
@@ -788,8 +800,31 @@ class FastCopier:
                             f"exit=0.99 pnl=+${pnl:.2f}"
                         )
                     elif ask_d <= self._LOSS_THRESHOLD:
+                        # Sub-cent entries (price < 0.01): exit at 0.01 would show
+                        # artificial profit since exit > entry. Let them ride to WIN only.
+                        if entry_price < 0.01:
+                            continue
+
                         exit_p = float(self._LOSS_THRESHOLD)
                         pnl = shares * exit_p - dollar_amount
+
+                        # MTM MISS: log positions that peaked at ≥2× before LOSS within 1hr
+                        try:
+                            age_min = (
+                                datetime.fromisoformat(now) - datetime.fromisoformat(opened_at)
+                            ).total_seconds() / 60
+                            if peak_price > 0 and entry_price > 0 and age_min < 60:
+                                peak_mult = peak_price / entry_price
+                                if peak_mult >= 2.0:
+                                    missed = shares * peak_price - dollar_amount
+                                    logger.warning(
+                                        f"MTM MISS #{trade_id}: peaked {peak_mult:.1f}x "
+                                        f"({peak_price:.4f}) before LOSS in {age_min:.0f}min"
+                                        f" — exit at peak would have yielded ${missed:+.2f}"
+                                    )
+                        except Exception:
+                            pass
+
                         await self._conn.execute(
                             "UPDATE fast_trades SET status='CLOSED_LOSS', "
                             "exit_price=?, pnl=?, closed_at=? WHERE id=?",
@@ -814,21 +849,24 @@ class FastCopier:
 
     async def _profit_lock_worker(self) -> None:
         """
-        Every 10 s: track each position's peak bid price.
-        When bid peaked at ≥ profit_lock_at × entry AND current bid drops to
-        ≤ peak × profit_lock_trail → sell immediately (CLOSED_PROFIT_LOCK).
+        Every 10 s: track each position's peak bid price and apply exit logic.
 
-        Example (defaults): bought at 0.10
-          → peak rises to 0.50 (5×) — trailing stop activates at 0.20 (2×)
-          → price falls back to 0.25 (50% of 0.50) → SELL, lock in 2.5× profit
+        Always-on: updates peak_price for all open positions regardless of flags.
+
+        Fast-exit (young positions, age < fast_exit_window min):
+          When fast_exit_at > 0 AND peak ≥ entry × fast_exit_at
+          AND current_bid ≤ peak × fast_exit_trail → CLOSED_PROFIT_LOCK
+
+        Normal profit-lock (all positions, when profit_lock_at > 0):
+          When peak ≥ entry × profit_lock_at
+          AND current_bid ≤ peak × profit_lock_trail → CLOSED_PROFIT_LOCK
         """
-        if self._profit_lock_at <= 0:
-            logger.info("Profit-lock worker disabled (profit_lock_at=0)")
-            return
-
+        lock_active = self._profit_lock_at > 0
+        fast_active = self._fast_exit_at > 0
         logger.info(
             f"Profit-lock worker started (10s poll, "
-            f"activate≥{self._profit_lock_at}× entry, "
+            f"lock={'@' + str(self._profit_lock_at) + 'x' if lock_active else 'disabled'}, "
+            f"fast-exit={'@' + str(self._fast_exit_at) + 'x <' + str(self._fast_exit_window) + 'min' if fast_active else 'disabled'}, "
             f"trail@{self._profit_lock_trail:.0%} of peak)"
         )
         while True:
@@ -836,7 +874,7 @@ class FastCopier:
             try:
                 rows = await self._conn.execute_fetchall(
                     "SELECT id, asset_id, entry_price, shares, dollar_amount, "
-                    "market_id, wallet_followed, COALESCE(peak_price, 0) "
+                    "market_id, wallet_followed, COALESCE(peak_price, 0), opened_at "
                     "FROM fast_trades WHERE status='OPEN'"
                 )
                 if not rows:
@@ -845,9 +883,13 @@ class FastCopier:
                 unique_assets = list({r[1] for r in rows if r[1]})
                 price_map = await self._fetch_prices(unique_assets)
 
+                peak_updates: List[Tuple[float, int]] = []
                 profit_locks = 0
+                now = datetime.utcnow()
+                now_iso = now.isoformat()
+
                 for (trade_id, asset_id, entry_price, shares,
-                     dollar_amount, market_id, wallet, peak_price) in rows:
+                     dollar_amount, market_id, wallet, peak_price, opened_at) in rows:
                     bid, ask = price_map.get(asset_id, (None, None))
 
                     # Use bid for value; fall back to ask if no bid quoted
@@ -859,31 +901,62 @@ class FastCopier:
                     if current >= float(self._WIN_THRESHOLD) or current <= float(self._LOSS_THRESHOLD):
                         continue
 
-                    # Update peak
+                    # Update peak (batched — committed once per cycle)
                     new_peak = max(float(peak_price), current)
                     if new_peak > float(peak_price):
+                        peak_updates.append((new_peak, trade_id))
+
+                    # Compute age for fast-exit eligibility
+                    try:
+                        age_min = (now - datetime.fromisoformat(opened_at)).total_seconds() / 60
+                    except Exception:
+                        age_min = 999.0
+
+                    fired = False
+
+                    # Fast-exit: young positions that spike then pull back
+                    if (
+                        fast_active
+                        and age_min < self._fast_exit_window
+                        and new_peak >= entry_price * self._fast_exit_at
+                        and current <= new_peak * self._fast_exit_trail
+                    ):
+                        exit_p = current
+                        pnl = shares * exit_p - dollar_amount
+                        tp_order_id = ""
+                        if self._live_mode:
+                            tp_order_id = await self._place_live_sell(asset_id, shares, current)
                         await self._conn.execute(
-                            "UPDATE fast_trades SET peak_price=? WHERE id=?",
-                            (new_peak, trade_id),
+                            "UPDATE fast_trades SET status='CLOSED_PROFIT_LOCK', "
+                            "exit_price=?, pnl=?, closed_at=?, tp_order_id=? WHERE id=?",
+                            (exit_p, pnl, now_iso, tp_order_id, trade_id),
+                        )
+                        self._open_keys.discard((market_id, wallet))
+                        profit_locks += 1
+                        fired = True
+                        logger.info(
+                            f"FAST EXIT #{trade_id}: entry={entry_price:.4f} "
+                            f"peak={new_peak:.4f} ({new_peak/entry_price:.1f}x) "
+                            f"age={age_min:.0f}min exit={exit_p:.4f} "
+                            f"({current/new_peak:.0%} of peak) pnl={pnl:+.2f}"
                         )
 
-                    # Fire trailing stop
+                    # Normal profit-lock: any age, fires only when enabled
                     if (
-                        new_peak >= entry_price * self._profit_lock_at
+                        not fired
+                        and lock_active
+                        and new_peak >= entry_price * self._profit_lock_at
                         and current <= new_peak * self._profit_lock_trail
                     ):
                         exit_p = current
                         pnl = shares * exit_p - dollar_amount
                         tp_order_id = ""
                         if self._live_mode:
-                            tp_order_id = await self._place_live_sell(
-                                asset_id, shares, current
-                            )
-                        now = datetime.utcnow().isoformat()
+                            tp_order_id = await self._place_live_sell(asset_id, shares, current)
                         await self._conn.execute(
                             "UPDATE fast_trades SET status='CLOSED_PROFIT_LOCK', "
                             "exit_price=?, pnl=?, closed_at=?, tp_order_id=? WHERE id=?",
-                            (exit_p, pnl, now, tp_order_id, trade_id),
+                            (exit_p, pnl, now_iso, tp_order_id, trade_id),
                         )
                         self._open_keys.discard((market_id, wallet))
                         profit_locks += 1
@@ -894,9 +967,18 @@ class FastCopier:
                             f"pnl={pnl:+.2f}"
                         )
 
-                if profit_locks:
+                # Batch peak updates — single commit covers both peaks and locks
+                if peak_updates:
+                    await self._conn.executemany(
+                        "UPDATE fast_trades SET peak_price=? WHERE id=?",
+                        peak_updates,
+                    )
+
+                if peak_updates or profit_locks:
                     await self._conn.commit()
-                    logger.info(f"Profit-lock: {profit_locks} positions exited this cycle")
+                    if profit_locks:
+                        logger.info(f"Profit-lock: {profit_locks} positions exited this cycle")
+
             except Exception as exc:
                 logger.error(f"Profit-lock worker error: {exc}")
 

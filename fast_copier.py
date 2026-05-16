@@ -128,6 +128,24 @@ def _parse_args() -> argparse.Namespace:
         default=0.50,
         help="Sell when bid drops to this fraction of peak (0.50 = 50%% of peak)",
     )
+    p.add_argument(
+        "--fast-exit-at",
+        type=float,
+        default=0.0,
+        help="Arm fast-exit trailing stop when bid reaches N× entry (0 = disabled)",
+    )
+    p.add_argument(
+        "--fast-exit-trail",
+        type=float,
+        default=0.50,
+        help="Fast-exit: sell when bid drops to this fraction of peak (0.50 = 50%%)",
+    )
+    p.add_argument(
+        "--fast-exit-window",
+        type=int,
+        default=60,
+        help="Fast-exit applies only to positions younger than this many minutes",
+    )
     return p.parse_args()
 
 
@@ -154,15 +172,19 @@ def main() -> None:
         )
 
     lock_str = (
-        f"profit_lock=OFF" if args.profit_lock_at <= 0
+        "profit_lock=OFF" if args.profit_lock_at <= 0
         else f"profit_lock={args.profit_lock_at}x→trail@{args.profit_lock_trail:.0%}"
+    )
+    fast_str = (
+        "fast_exit=OFF" if args.fast_exit_at <= 0
+        else f"fast_exit={args.fast_exit_at}x/<{args.fast_exit_window}min→trail@{args.fast_exit_trail:.0%}"
     )
     logger.info(
         f"FastCopier config — scanner_db={args.scanner_db} "
         f"fast_db={args.fast_db} max_price={args.max_price} "
         f"bankroll=${args.bankroll:,.2f} "
         f"live={'ON max_bet=$' + str(args.live_max_bet) if args.live else 'OFF (paper only)'} "
-        f"{lock_str}"
+        f"{lock_str} {fast_str}"
     )
 
     copier = FastCopier(
@@ -179,6 +201,9 @@ def main() -> None:
         live_slippage=args.live_slippage,
         profit_lock_at=args.profit_lock_at,
         profit_lock_trail=args.profit_lock_trail,
+        fast_exit_at=args.fast_exit_at,
+        fast_exit_trail=args.fast_exit_trail,
+        fast_exit_window=args.fast_exit_window,
     )
 
     try:

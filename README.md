@@ -13,12 +13,14 @@ A strategy engine that scans Polymarket wallets for proven high-RR traders, copi
 5. [Full Server Setup (Step-by-Step)](#full-server-setup-step-by-step)
 6. [Systemd Services](#systemd-services)
 7. [WireGuard VPN (Live Trading)](#wireguard-vpn-live-trading)
-8. [Cron Jobs](#cron-jobs)
-9. [Running the System](#running-the-system)
-10. [Configuration Reference](#configuration-reference)
-11. [Database Schema](#database-schema)
-12. [Telegram Notifications](#telegram-notifications)
-13. [Troubleshooting](#troubleshooting)
+8. [Live CLOB Wallet Funding](#live-clob-wallet-funding)
+9. [Brazil SOCKS5 Proxy](#brazil-socks5-proxy)
+10. [Cron Jobs](#cron-jobs)
+11. [Running the System](#running-the-system)
+12. [Configuration Reference](#configuration-reference)
+13. [Database Schema](#database-schema)
+14. [Telegram Notifications](#telegram-notifications)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -228,28 +230,60 @@ T=5000ms Market resolves to 0.99 → auto-closed as WIN
 | Paper-trade loop needed | Yes (`python main.py paper-trade`) | No — self-contained |
 | Best for | Conservative validation | Sub-second market copying |
 
+### Trading Logic and Entry Filters
+
+**Price bucket filter**: entries in the `0.10–0.15` range are skipped. Paper data shows this bucket is net-negative despite an 11.6% win rate because R:R at 9:1 is insufficient for actual market resolution patterns.
+
+**Sub-cent entries** (`price < 0.01`): the position closer skips the LOSS exit for these positions — they hold until WIN (ask ≥ 0.99) or a fast-exit trailing stop fires. In paper mode, selling at 0.01 would show fake profit because exit > sub-cent entry; in live mode no such sell is actually executable.
+
+**MTM MISS tracking**: when a position closes as LOSS and `peak_price ≥ 2× entry` within the first 60 minutes, a WARNING is logged with the missed profit. Run the MTM query below after a few days to size the fast-exit opportunity.
+
+**Fast-exit trailing stop**: optional mechanism targeting positions that spike then reverse. Applies only to positions younger than `--fast-exit-window` minutes (default 60). Separate from the normal profit-lock which covers any-age positions.
+
+**Peak price tracking**: the `_profit_lock_worker` always runs (even with `--profit-lock-at 0`) and updates `peak_price` for every open position every 10 seconds. This enables MTM analysis and fast-exit independently.
+
 ### Running FastCopier
 
 ```bash
-# Basic — uses all defaults (bankroll $2000, max price 0.20)
-python fast_copier.py
+# Basic — paper mode
+python fast_copier.py --bankroll 750 --max-price 0.30
+
+# Live mode with $1 fixed bet on $500 deposit
+python fast_copier.py --bankroll 750 --max-price 0.30 \
+  --live --live-env /root/copybot-live/polymarket-copybot/.env \
+  --live-max-bet 1.0
+
+# Enable fast-exit: sell if position spikes 2× then drops to 50% of peak (within 60 min)
+python fast_copier.py --bankroll 750 --max-price 0.30 \
+  --fast-exit-at 2.0 --fast-exit-trail 0.50 --fast-exit-window 60
+
+# Enable normal profit-lock: fires for any-age position once peak ≥ 2× entry
+python fast_copier.py --bankroll 750 --max-price 0.30 \
+  --profit-lock-at 2.0 --profit-lock-trail 0.50
 
 # Tighter price filter
 python fast_copier.py --max-price 0.15
-
-# With custom bankroll matching your actual scanner bankroll
-python fast_copier.py --bankroll 3733
-
-# Point at scanner DB if in different directory
-python fast_copier.py \
-  --scanner-db /path/to/polymarket_scanner.db \
-  --fast-db /path/to/fast_copier.db
 
 # Debug logging
 python fast_copier.py --log-level DEBUG
 
 # All options
 python fast_copier.py --help
+```
+
+**MTM analysis query** (run after collecting peak_price data for a few days):
+```bash
+sqlite3 fast_copier.db "
+SELECT
+  COUNT(*) as mtm_miss_count,
+  ROUND(AVG(peak_price / entry_price), 2) as avg_peak_mult,
+  ROUND(SUM(shares * peak_price - dollar_amount), 2) as total_missed_profit
+FROM fast_trades
+WHERE status='CLOSED_LOSS'
+  AND peak_price > 0
+  AND peak_price >= entry_price * 2.0
+  AND (julianday(closed_at) - julianday(opened_at)) * 1440 < 60;
+"
 ```
 
 The FastCopier only **reads** from `polymarket_scanner.db` (for wallet scores and asset IDs) — it never writes to it. All positions are written to `fast_copier.db`. You can copy just the scanner DB to a low-latency VPS and run the FastCopier there independently.
@@ -452,7 +486,7 @@ Create `/etc/systemd/system/polymarket-fast-copier.service`:
 ```ini
 [Unit]
 Description=Polymarket FastCopier (sub-second, NJ)
-After=network-online.target
+After=network-online.target brazil-proxy.service
 Wants=network-online.target
 
 [Service]
@@ -461,19 +495,23 @@ User=root
 WorkingDirectory=/root/polymarket-wallet-scanner-trader
 ExecStart=/root/polymarket-wallet-scanner-trader/.venv/bin/python3 fast_copier.py \
     --bankroll 750 \
-    --max-price 0.20 \
+    --max-price 0.30 \
     --max-pos-pct 0.005 \
     --kelly 0.25 \
-    --log-file logs/fast_copier.log
+    --log-file logs/fast_copier.log \
+    --profit-lock-at 0
 Restart=always
 RestartSec=10
 StandardOutput=append:/root/polymarket-wallet-scanner-trader/logs/fast_copier.log
 StandardError=append:/root/polymarket-wallet-scanner-trader/logs/fast_copier.log
 Environment=PYTHONUNBUFFERED=1
+Environment=CLOB_PROXY=socks5://127.0.0.1:1080
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+> This is the **paper mode** template. `CLOB_PROXY` routes live orders through the Brazil SOCKS5 proxy (see [Brazil Proxy](#brazil-socks5-proxy) below). Add `--live --live-env ... --live-max-bet 1.0` to ExecStart to enable live trading after funding the CLOB wallet.
 
 > Adjust `--bankroll` to match your actual starting capital and `--max-pos-pct` to the fraction per trade (0.005 = 0.5%, so $3.75 per trade on $750).
 
@@ -603,6 +641,120 @@ Mullvad allows up to 5 devices on one account. To access Polymarket on your lapt
 4. Polymarket.com will load immediately
 
 The server's WireGuard key and your desktop Mullvad app use separate device slots — they don't interfere.
+
+---
+
+## Live CLOB Wallet Funding
+
+The live wallet must hold enough USDC on Polygon to sustain continuous buying. Capital recycles as markets resolve (wins return ~$37 per $3.75 bet at 0.10 avg entry; losses return ~$0.38), but the net drain means the wallet needs a sufficient buffer.
+
+### Observed trading rate (NJ VPS, 16 tracked wallets)
+
+| Metric | Value |
+|--------|-------|
+| Average trades/hour | ~80 |
+| Peak trades/hour (05–06 UTC) | ~110 |
+| Per-trade cost | $3.75–$5.00 (`--live-max-bet 5.0`) |
+| Gross spend | ~$300–$550/hour |
+| Capital recovered/hour | ~$210 (wins + loss residuals) |
+| **Net drain** | **~$100–$150/hour** |
+
+### Deposit sizing guide
+
+| Deposit | Runway | Notes |
+|---------|--------|-------|
+| $200 | ~1.5–2h | Too thin — one quiet period drains it before wins return |
+| **$500** | **~4–5h** | **Minimum viable — wins start recycling capital within this window** |
+| **$1,000** | **~8–10h** | **Safe choice — covers overnight without attention** |
+| $2,000 | ~20h | Matches full paper position exposure |
+
+### Switching between paper and live mode
+
+**Disable live mode** (while waiting for deposit):
+
+```bash
+# Edit service — remove --live --live-env ... --live-max-bet flags
+nano /etc/systemd/system/polymarket-fast-copier.service
+systemctl daemon-reload && systemctl restart polymarket-fast-copier
+```
+
+**Re-enable live mode** after deposit:
+
+```bash
+# Edit /etc/systemd/system/polymarket-fast-copier.service
+# Replace ExecStart with:
+ExecStart=.../fast_copier.py --bankroll 750 --max-price 0.30 --max-pos-pct 0.005 \
+  --kelly 0.25 --log-file logs/fast_copier.log \
+  --live --live-env /root/copybot-live/polymarket-copybot/.env \
+  --live-max-bet 1.0 --profit-lock-at 0
+# Then:
+systemctl daemon-reload && systemctl restart polymarket-fast-copier
+```
+
+> `--live-max-bet 1.0` = $1 fixed bet per order. Suitable for a $500 deposit — enough margin for ~60+ simultaneous positions before capital recycles from resolved wins. Raise to $2–5 on a $1,000+ deposit.
+
+**Verify wallet balance before starting live mode:**
+
+```bash
+# Check on-chain USDC balance (Polygon, 6 decimals)
+# balance: 3428413 = $3.43 USDC — each order needs $3.75–$5.00
+# Look for "not enough balance" errors in the log
+tail -20 logs/fast_copier.log | grep -E "balance|ERROR"
+```
+
+---
+
+## Brazil SOCKS5 Proxy
+
+Live CLOB orders (`POST /order`) may be geo-blocked from a US VPS. The solution is a persistent SOCKS5 tunnel through a Brazil server, which `py-clob-client-v2` routes automatically via the `CLOB_PROXY` environment variable.
+
+### How it works
+
+```
+NJ VPS → SOCKS5 tunnel → Brazil VPS (216.238.119.143) → Polymarket CLOB
+```
+
+The Brazil VPS has no geo-restriction. All other traffic (WebSocket, REST reads, SSH) stays direct from the NJ VPS — no latency impact on detection.
+
+### Setup
+
+Create `/etc/systemd/system/brazil-proxy.service`:
+
+```ini
+[Unit]
+Description=Brazil SOCKS5 SSH Tunnel (Polymarket order routing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/ssh -N -o StrictHostKeyChecking=no \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -D 127.0.0.1:1080 root@216.238.119.143
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable brazil-proxy
+systemctl start brazil-proxy
+```
+
+The FastCopier service file must have:
+```ini
+After=network-online.target brazil-proxy.service
+Environment=CLOB_PROXY=socks5://127.0.0.1:1080
+```
+
+### Latency
+
+Live order round-trip via Brazil proxy: ~386ms. Acceptable for prediction markets (positions hold for minutes to hours). WebSocket trade detection remains at ~10–20ms direct.
 
 ---
 
