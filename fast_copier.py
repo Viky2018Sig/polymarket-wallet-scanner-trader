@@ -60,6 +60,12 @@ def _parse_args() -> argparse.Namespace:
         help="Only copy trades at or below this price",
     )
     p.add_argument(
+        "--min-price",
+        type=float,
+        default=0.0,
+        help="Only copy trades at or above this price (0 = no floor)",
+    )
+    p.add_argument(
         "--bankroll",
         type=float,
         default=2000.0,
@@ -146,6 +152,12 @@ def _parse_args() -> argparse.Namespace:
         default=60,
         help="Fast-exit applies only to positions younger than this many minutes",
     )
+    p.add_argument(
+        "--breakeven-at",
+        type=float,
+        default=0.0,
+        help="Move stop to entry price once peak reaches N× entry (0 = disabled)",
+    )
     return p.parse_args()
 
 
@@ -179,18 +191,23 @@ def main() -> None:
         "fast_exit=OFF" if args.fast_exit_at <= 0
         else f"fast_exit={args.fast_exit_at}x/<{args.fast_exit_window}min→trail@{args.fast_exit_trail:.0%}"
     )
+    be_str = (
+        "breakeven=OFF" if args.breakeven_at <= 0
+        else f"breakeven@{args.breakeven_at}x"
+    )
     logger.info(
         f"FastCopier config — scanner_db={args.scanner_db} "
-        f"fast_db={args.fast_db} max_price={args.max_price} "
+        f"fast_db={args.fast_db} price=[{args.min_price},{args.max_price}] "
         f"bankroll=${args.bankroll:,.2f} "
         f"live={'ON max_bet=$' + str(args.live_max_bet) if args.live else 'OFF (paper only)'} "
-        f"{lock_str} {fast_str}"
+        f"{lock_str} {fast_str} {be_str}"
     )
 
     copier = FastCopier(
         scanner_db_path=args.scanner_db,
         fast_db_path=args.fast_db,
         max_entry_price=args.max_price,
+        min_entry_price=args.min_price,
         starting_bankroll=args.bankroll,
         max_position_pct=args.max_pos_pct,
         kelly_fraction=args.kelly,
@@ -204,6 +221,7 @@ def main() -> None:
         fast_exit_at=args.fast_exit_at,
         fast_exit_trail=args.fast_exit_trail,
         fast_exit_window=args.fast_exit_window,
+        breakeven_at=args.breakeven_at,
     )
 
     try:

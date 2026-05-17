@@ -110,6 +110,7 @@ class FastCopier:
         scanner_db_path: str,
         fast_db_path: str,
         max_entry_price: float = 0.20,
+        min_entry_price: float = 0.0,
         starting_bankroll: float = 2000.0,
         max_position_pct: float = 0.0025,
         kelly_fraction: float = 0.25,
@@ -123,10 +124,12 @@ class FastCopier:
         fast_exit_at: float = 0.0,
         fast_exit_trail: float = 0.50,
         fast_exit_window: int = 60,
+        breakeven_at: float = 0.0,
     ) -> None:
         self._scanner_db = scanner_db_path
         self._fast_db = fast_db_path
         self._max_entry = max_entry_price
+        self._min_entry = min_entry_price
         self._bankroll = Decimal(str(starting_bankroll))
         self._max_pos_pct = max_position_pct
         self._kelly_frac = kelly_fraction
@@ -141,6 +144,8 @@ class FastCopier:
         self._fast_exit_at = fast_exit_at        # N× entry to arm (0 = disabled)
         self._fast_exit_trail = fast_exit_trail  # sell when bid drops to this fraction of peak
         self._fast_exit_window = fast_exit_window  # minutes a position is considered "young"
+        # Breakeven stop: once peak ≥ N× entry, stop moves to entry price
+        self._breakeven_at = breakeven_at        # N× entry to arm (0 = disabled)
         self._clob_client: Any = None
 
         # asset_id → (wallet_address_lower, market_id)
@@ -157,6 +162,17 @@ class FastCopier:
 
         # WS event queue: (asset_id, price_str, tx_hash)
         self._event_queue: asyncio.Queue[Tuple[str, str, str]] = asyncio.Queue(maxsize=5000)
+
+        # Real-time exit queue: (trade_id, asset_id, price, peak, reason)
+        # reason: "fast_exit" | "breakeven"
+        # Populated by _ws_worker on every price tick for open positions
+        self._ws_exit_queue: asyncio.Queue[Tuple[int, str, float, float, str]] = asyncio.Queue(maxsize=5000)
+
+        # In-memory open position index for sub-second WS fast-exit
+        # asset_id → (trade_id, entry_price, shares, dollar_amount, market_id, wallet, opened_at)
+        self._open_pos: Dict[str, Tuple[int, float, float, float, str, str, str]] = {}
+        # asset_id → current peak (mirrors DB peak_price, updated in real-time)
+        self._ws_peaks: Dict[str, float] = {}
 
         # Set to trigger WS reconnect with refreshed subscription list
         self._resubscribe = asyncio.Event()
@@ -236,9 +252,17 @@ class FastCopier:
 
     async def _load_open_keys(self) -> None:
         rows = await self._conn.execute_fetchall(
-            "SELECT market_id, wallet_followed FROM fast_trades WHERE status='OPEN'"
+            "SELECT id, asset_id, market_id, wallet_followed, entry_price, shares, "
+            "dollar_amount, opened_at, COALESCE(peak_price, 0) "
+            "FROM fast_trades WHERE status='OPEN'"
         )
-        self._open_keys = {(r[0], r[1]) for r in rows}
+        self._open_keys = {(r[2], r[3]) for r in rows}
+        self._open_pos = {}
+        self._ws_peaks = {}
+        for (tid, asset_id, market_id, wallet, entry, shares, cost, opened_at, peak) in rows:
+            if asset_id:
+                self._open_pos[asset_id] = (tid, entry, shares, cost, market_id, wallet, opened_at)
+                self._ws_peaks[asset_id] = float(peak)
         logger.info(f"{len(self._open_keys)} open positions loaded from fast DB")
 
     # ── Live order helpers ────────────────────────────────────────────────────
@@ -377,6 +401,7 @@ class FastCopier:
                 self._activity_poller(),
                 self._position_closer(),
                 self._profit_lock_worker(),
+                self._ws_exit_checker(),
                 self._asset_refresher(),
                 self._snapshot_worker(),
             )
@@ -443,14 +468,12 @@ class FastCopier:
                         for event in events:
                             if event.get("event_type") != "last_trade_price":
                                 continue
-                            if event.get("side", "").upper() != "BUY":
-                                continue
 
                             asset_id = event.get("asset_id", "")
                             price_str = event.get("price", "0")
                             tx_hash = event.get("transaction_hash", "")
 
-                            if not asset_id or asset_id not in self._asset_map:
+                            if not asset_id:
                                 continue
 
                             try:
@@ -458,7 +481,45 @@ class FastCopier:
                             except (ValueError, TypeError):
                                 continue
 
-                            if price <= 0 or price > self._max_entry:
+                            if price <= 0:
+                                continue
+
+                            # Real-time exits: any price tick for an open position
+                            pos = self._open_pos.get(asset_id)
+                            if pos:
+                                trade_id, entry_price = pos[0], pos[1]
+                                new_peak = max(self._ws_peaks.get(asset_id, 0.0), price)
+                                self._ws_peaks[asset_id] = new_peak
+                                reason = ""
+                                # Breakeven stop (lower threshold, checked first)
+                                if (
+                                    self._breakeven_at > 0
+                                    and new_peak >= entry_price * self._breakeven_at
+                                    and price <= entry_price
+                                ):
+                                    reason = "breakeven"
+                                # Fast-exit trailing stop
+                                elif (
+                                    self._fast_exit_at > 0
+                                    and new_peak >= entry_price * self._fast_exit_at
+                                    and price <= new_peak * self._fast_exit_trail
+                                ):
+                                    reason = "fast_exit"
+                                if reason:
+                                    try:
+                                        self._ws_exit_queue.put_nowait(
+                                            (trade_id, asset_id, price, new_peak, reason)
+                                        )
+                                    except asyncio.QueueFull:
+                                        pass
+
+                            # New trade entry: BUY only, within price ceiling
+                            side = event.get("side", "").upper()
+                            if side != "BUY":
+                                continue
+                            if asset_id not in self._asset_map:
+                                continue
+                            if price > self._max_entry:
                                 continue
 
                             matches_60s += 1
@@ -525,6 +586,9 @@ class FastCopier:
         if price <= 0 or price > self._max_entry:
             return False
 
+        if self._min_entry > 0 and price < self._min_entry:
+            return False
+
         # Skip the 0.10–0.15 bucket — insufficient R:R for observed win rates
         if 0.10 <= price < 0.15:
             return False
@@ -565,6 +629,10 @@ class FastCopier:
             if cur.rowcount == 0:
                 return False  # UNIQUE constraint — already exists
 
+            # Register in real-time fast-exit index
+            trade_id = cur.lastrowid
+            self._open_pos[asset_id] = (trade_id, price, shares, dollar_amount, market_id, wallet, opened_at)
+            self._ws_peaks[asset_id] = 0.0
             self._open_keys.add(key)
             logger.info(
                 f"FAST COPY [{source}]: wallet={wallet[:10]}… "
@@ -645,6 +713,9 @@ class FastCopier:
                 if price <= 0 or price > self._max_entry:
                     continue
 
+                if self._min_entry > 0 and price < self._min_entry:
+                    continue
+
                 asset_id = str(t.get("asset") or "")
                 market_id = str(t.get("conditionId") or "")
                 tx_hash = str(t.get("transactionHash") or "")
@@ -676,6 +747,79 @@ class FastCopier:
                 )
             except Exception as exc:
                 logger.error(f"Activity poller error: {exc}")
+
+    # ── Real-time WS fast-exit worker ────────────────────────────────────────
+
+    def _evict_open_pos(self, asset_id: str) -> None:
+        """Remove asset from real-time fast-exit index when a position closes."""
+        self._open_pos.pop(asset_id, None)
+        self._ws_peaks.pop(asset_id, None)
+
+    async def _ws_exit_checker(self) -> None:
+        """
+        Drains _ws_exit_queue — populated by _ws_worker on every price tick.
+        Executes fast-exit closes in sub-second time rather than waiting for
+        the 10-second _profit_lock_worker poll.
+        """
+        logger.info("WS fast-exit checker started (sub-second granularity)")
+        while True:
+            try:
+                trade_id, asset_id, price, peak, reason = await self._ws_exit_queue.get()
+            except Exception:
+                continue
+            try:
+                pos = self._open_pos.get(asset_id)
+                if pos is None:
+                    continue  # already closed by another path
+
+                _, entry_price, shares, dollar_amount, market_id, wallet, opened_at = pos
+
+                # Age guard — breakeven stop applies at any age; fast-exit is window-limited
+                try:
+                    age_min = (
+                        datetime.utcnow() - datetime.fromisoformat(opened_at)
+                    ).total_seconds() / 60
+                except Exception:
+                    age_min = 999.0
+
+                if reason == "fast_exit" and age_min >= self._fast_exit_window:
+                    continue
+
+                exit_p = price
+                pnl = shares * exit_p - dollar_amount
+                tp_order_id = ""
+                if self._live_mode:
+                    tp_order_id = await self._place_live_sell(asset_id, shares, price)
+
+                now_iso = datetime.utcnow().isoformat()
+                await self._conn.execute(
+                    "UPDATE fast_trades SET status='CLOSED_PROFIT_LOCK', "
+                    "exit_price=?, pnl=?, closed_at=?, peak_price=?, tp_order_id=? "
+                    "WHERE id=? AND status='OPEN'",
+                    (exit_p, pnl, now_iso, peak, tp_order_id, trade_id),
+                )
+                await self._conn.commit()
+
+                self._open_keys.discard((market_id, wallet))
+                self._evict_open_pos(asset_id)
+
+                if reason == "breakeven":
+                    logger.info(
+                        f"WS BREAKEVEN #{trade_id}: entry={entry_price:.4f} "
+                        f"peak={peak:.4f} ({peak/entry_price:.1f}x) "
+                        f"age={age_min:.0f}min exit={exit_p:.4f} pnl={pnl:+.2f}"
+                    )
+                else:
+                    logger.info(
+                        f"WS FAST EXIT #{trade_id}: entry={entry_price:.4f} "
+                        f"peak={peak:.4f} ({peak/entry_price:.1f}x) "
+                        f"age={age_min:.0f}min exit={exit_p:.4f} "
+                        f"({exit_p/peak:.0%} of peak) pnl={pnl:+.2f}"
+                    )
+            except Exception as exc:
+                logger.error(f"WS exit checker error: {exc}")
+            finally:
+                self._ws_exit_queue.task_done()
 
     # ── Live sell helper ──────────────────────────────────────────────────────
 
@@ -794,6 +938,7 @@ class FastCopier:
                             (exit_p, pnl, now, trade_id),
                         )
                         self._open_keys.discard((market_id, wallet))
+                        self._evict_open_pos(asset_id)
                         wins += 1
                         logger.info(
                             f"FAST WIN #{trade_id}: entry={entry_price:.4f} "
@@ -831,6 +976,7 @@ class FastCopier:
                             (exit_p, pnl, now, trade_id),
                         )
                         self._open_keys.discard((market_id, wallet))
+                        self._evict_open_pos(asset_id)
                         losses += 1
                         logger.info(
                             f"FAST LOSS #{trade_id}: entry={entry_price:.4f} "
@@ -914,6 +1060,33 @@ class FastCopier:
 
                     fired = False
 
+                    # Breakeven stop (10s poll backup — WS checker fires first normally)
+                    if (
+                        not fired
+                        and self._breakeven_at > 0
+                        and new_peak >= entry_price * self._breakeven_at
+                        and current <= entry_price
+                    ):
+                        exit_p = current
+                        pnl = shares * exit_p - dollar_amount
+                        tp_order_id = ""
+                        if self._live_mode:
+                            tp_order_id = await self._place_live_sell(asset_id, shares, current)
+                        await self._conn.execute(
+                            "UPDATE fast_trades SET status='CLOSED_PROFIT_LOCK', "
+                            "exit_price=?, pnl=?, closed_at=?, tp_order_id=? WHERE id=?",
+                            (exit_p, pnl, now_iso, tp_order_id, trade_id),
+                        )
+                        self._open_keys.discard((market_id, wallet))
+                        self._evict_open_pos(asset_id)
+                        profit_locks += 1
+                        fired = True
+                        logger.info(
+                            f"BREAKEVEN #{trade_id}: entry={entry_price:.4f} "
+                            f"peak={new_peak:.4f} ({new_peak/entry_price:.1f}x) "
+                            f"exit={exit_p:.4f} pnl={pnl:+.2f}"
+                        )
+
                     # Fast-exit: young positions that spike then pull back
                     if (
                         fast_active
@@ -932,6 +1105,7 @@ class FastCopier:
                             (exit_p, pnl, now_iso, tp_order_id, trade_id),
                         )
                         self._open_keys.discard((market_id, wallet))
+                        self._evict_open_pos(asset_id)
                         profit_locks += 1
                         fired = True
                         logger.info(
@@ -959,6 +1133,7 @@ class FastCopier:
                             (exit_p, pnl, now_iso, tp_order_id, trade_id),
                         )
                         self._open_keys.discard((market_id, wallet))
+                        self._evict_open_pos(asset_id)
                         profit_locks += 1
                         logger.info(
                             f"PROFIT LOCK #{trade_id}: entry={entry_price:.4f} "
